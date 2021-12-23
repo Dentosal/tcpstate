@@ -1,5 +1,7 @@
+//! TCP as per https://www.ietf.org/rfc/rfc793.txt
+
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
-#![feature(default_free_fn, duration_constants, let_else)]
+#![feature(default_free_fn, duration_constants, let_else, drain_filter)]
 #![allow(dead_code, unreachable_code, unused)]
 
 #[macro_use]
@@ -15,7 +17,10 @@ mod event;
 mod result;
 mod segment;
 
-pub use result::{Error, Res};
+use event::WaitFor;
+
+pub use event::Cookie;
+pub use result::Error;
 pub use segment::{SegmentFlags, SegmentMeta};
 
 #[cfg(feature = "std")]
@@ -68,6 +73,28 @@ const INITIAL_WINDOW_SIZE: u16 = 0x1000;
 const MAX_SEGMENT_SIZE: usize = 512;
 const SLOW_START_TRESHOLD: u16 = 512;
 
+/// Response to a packet when the socket is closed
+/// RFC 793 page 64
+pub fn response_to_closed(seg: SegmentMeta) -> SegmentMeta {
+    if seg.flags.contains(SegmentFlags::ACK) {
+        SegmentMeta {
+            seqn: 0,
+            ackn: seg.seqn.wrapping_add(seg.data.len() as u32),
+            window: 0,
+            flags: SegmentFlags::RST | SegmentFlags::ACK,
+            data: Vec::new(),
+        }
+    } else {
+        SegmentMeta {
+            seqn: seg.ackn,
+            ackn: 0,
+            window: 0,
+            flags: SegmentFlags::RST,
+            data: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SocketOptions {
     /// Set to Duration::ZERO for TCP_NODELAY
@@ -81,9 +108,11 @@ impl Default for SocketOptions {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SendSeq {
+    /// Oldest unacknowledged sequence number
     unack: u32,
+    /// Send sequence number to use when sending
     next: u32,
     window: u16,
     init_seqn: u32,
@@ -95,9 +124,20 @@ impl SendSeq {
         self.next < self.unack + (self.window as u32)
     }
 }
+impl Default for SendSeq {
+    fn default() -> Self {
+        Self {
+            unack: 0,
+            next: 0,
+            window: INITIAL_WINDOW_SIZE,
+            init_seqn: 0,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RecvSeq {
+    /// Next sequence number to expect
     next: u32,
     window: u16,
     init_seqn: u32,
@@ -128,13 +168,17 @@ pub struct Buffers {
     /// Out-of-order received packets
     oo_rx: VecDeque<SegmentMeta>,
     /// Data ready for reading
-    rx: VecDeque<Vec<u8>>,
+    readable: VecDeque<Vec<u8>>,
     /// Packets to be sent after the call
     send_now: VecDeque<SegmentMeta>,
 }
 
 fn duration_absdiff(a: Duration, b: Duration) -> Duration {
-    if a > b { a - b } else { b - a }
+    if a > b {
+        a - b
+    } else {
+        b - a
+    }
 }
 
 /// Timings per https://datatracker.ietf.org/doc/html/rfc6298
@@ -192,6 +236,7 @@ pub struct Socket {
     buffers: Buffers,
     timings: Timings,
     timers: Timers,
+    pending: Vec<(WaitFor, Cookie)>,
     pub options: SocketOptions,
 }
 
@@ -209,14 +254,25 @@ impl Socket {
             buffers: Buffers::default(),
             timings: Timings::default(),
             timers: Timers::default(),
+            pending: Vec::new(),
             options: SocketOptions::default(),
         }
     }
 
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
         *self = Self::new();
     }
 
+    fn trigger<F>(&mut self, f: F)
+    where
+        F: Fn(WaitFor) -> bool,
+    {
+        for (_, cookie) in self.pending.drain_filter(|(wait, _)| f(*wait)) {
+            todo!("Trigger cookie {:?}", cookie);
+        }
+    }
+
+    /// RFC793, page 25
     fn check_segment_seq_ok(&self, seg: &SegmentMeta) -> bool {
         if self.rx_seq.window == 0 {
             seg.data.len() == 0 && seg.seqn == self.rx_seq.next
@@ -268,19 +324,23 @@ impl Socket {
         result
     }
 
-    fn rx_buf_len(&self) -> usize {
-        self.buffers.rx.iter().map(|b| b.len()).sum()
+    fn readable_buf_len(&self) -> usize {
+        self.buffers.readable.iter().map(|b| b.len()).sum()
+    }
+
+    pub fn take_outbound(&mut self) -> Option<SegmentMeta> {
+        self.buffers.send_now.pop_front()
     }
 
     /// Takes up to `limit` bytes of input
-    fn rx_buf_take(&mut self, limit: usize) -> Vec<u8> {
+    fn readable_buf_take(&mut self, limit: usize) -> Vec<u8> {
         let mut result = Vec::new();
 
-        while let Some(value) = self.buffers.rx.pop_front() {
+        while let Some(value) = self.buffers.readable.pop_front() {
             result.extend(value);
             if result.len() >= limit {
                 let rest = result.split_off(limit);
-                self.buffers.rx.push_front(rest);
+                self.buffers.readable.push_front(rest);
                 return result;
             }
         }
@@ -289,7 +349,7 @@ impl Socket {
     }
 
     /// Establish a connection
-    pub fn call_connect(&mut self, remote: RemoteAddr) -> Res {
+    pub fn call_connect(&mut self, remote: RemoteAddr) -> Result<(), Error> {
         dbg!(self.connection_state);
         log::trace!("call_connect {:?}", remote);
         if self.connection_state == ConnectionState::Closed {
@@ -305,33 +365,34 @@ impl Socket {
                 flags: SegmentFlags::SYN,
                 data: Vec::new(),
             });
-            Res::empty()
+            Ok(())
         } else {
-            Res::error(Error::InvalidStateTransition)
+            Err(Error::InvalidStateTransition)
         }
     }
 
     /// Listen for connection
-    pub fn call_listen(&mut self) -> Res {
+    pub fn call_listen(&mut self) -> Result<(), Error> {
         dbg!(self.connection_state);
         log::trace!("call_listen");
         if self.connection_state == ConnectionState::Closed {
             self.connection_state = ConnectionState::Listen;
-            Res::empty()
+            Ok(())
         } else {
-            Res::error(Error::InvalidStateTransition)
+            Err(Error::InvalidStateTransition)
         }
     }
 
     /// Send some data
-    pub fn call_send(&mut self, input_data: Vec<u8>) -> Res {
+    /// RFC 793 page 55
+    pub fn call_send(&mut self, input_data: Vec<u8>) -> Result<(), Error> {
         dbg!(self.connection_state);
         log::trace!("call_send {:?}", input_data);
         match self.connection_state {
-            ConnectionState::Listen => Res::error(Error::NotConnected),
+            ConnectionState::Listen => Err(Error::NotConnected),
             ConnectionState::SynSent | ConnectionState::SynReceived => {
                 todo!("queue until ESTABLISHED");
-            },
+            }
             ConnectionState::Established | ConnectionState::CloseWait => {
                 self.buffers.tx.push_back(input_data);
                 log::trace!("Cond1? {:?}", (self.tx_seq.unack_has_space()));
@@ -346,11 +407,10 @@ impl Socket {
                         )
                     );
                     if self.tx_buf_len() >= MAX_SEGMENT_SIZE
-                        || self.options.nagle_delay == Duration::ZERO
+                        || (self.tx_buf_len() > 0 && self.options.nagle_delay == Duration::ZERO)
                     {
                         let data_to_send = self.tx_buf_take(MAX_SEGMENT_SIZE);
                         let len = data_to_send.len();
-                        self.tx_seq.next = self.tx_seq.next.wrapping_add(len as u32); // XXX: is this before or after creating seg?
                         log::trace!("Sending packet with data {:?}", data_to_send);
                         let seg = SegmentMeta {
                             seqn: self.tx_seq.next,
@@ -360,70 +420,69 @@ impl Socket {
                             data: data_to_send,
                         };
                         self.buffers.re_tx.push_back(seg.clone());
+                        // Piggybacked ACK in established
+                        // https://en.wikipedia.org/wiki/Piggybacking_(data_transmission)
                         self.buffers.send_now.push_back(seg);
                         self.timers.re_tx = Some(Instant::now().add(self.timings.rto));
-                        // Piggybacked ACK in ESTABLISHED
-                        // https://en.wikipedia.org/wiki/Piggybacking_(data_transmission)
-                        return Res::empty();
+                        self.tx_seq.next = self.tx_seq.next.wrapping_add(len as u32); // XXX: is this before or after creating seg?
+                        return Ok(());
                     }
                 }
-                Res::empty()
-            },
+                Ok(())
+            }
             ConnectionState::FinWait1
             | ConnectionState::FinWait2
             | ConnectionState::Closing
             | ConnectionState::TimeWait
-            | ConnectionState::LastAck => Res::error(Error::ConnectionClosing),
-            ConnectionState::Closed => Res::error(Error::NotConnected),
+            | ConnectionState::LastAck => Err(Error::ConnectionClosing),
+            ConnectionState::Closed => Err(Error::NotConnected),
         }
     }
 
     /// Receive some data, if any available
-    pub fn call_recv(&mut self, buffer: &mut [u8]) -> Res<usize> {
+    pub fn call_recv(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
         dbg!(self.connection_state);
         log::trace!("call_recv len={}", buffer.len());
         match self.connection_state {
             ConnectionState::Listen | ConnectionState::SynSent | ConnectionState::SynReceived => {
                 todo!("queue until ESTABLISHED");
-            },
+            }
             ConnectionState::Established => {
-                if self.rx_buf_len() >= buffer.len() {
-                    let data = self.rx_buf_take(buffer.len());
+                if self.readable_buf_len() >= buffer.len() {
+                    let data = self.readable_buf_take(buffer.len());
                     buffer.copy_from_slice(&data);
-                    Res::value(data.len())
+                    Ok(data.len())
                 } else {
                     todo!("QUEUE reg");
                 }
-            },
+            }
             ConnectionState::FinWait1 | ConnectionState::FinWait2 => {
                 let has_data = todo!("queue_has_enough_data");
                 // if !(has_data) {
                 //     todo!("QUEUE reg");
-                //     return Res::empty();
+                //     return Ok(());
                 // }
 
                 todo!("Reassemble");
                 todo!("Signal user for data");
-                Res::empty()
-            },
+            }
             ConnectionState::CloseWait => {
                 if todo!("data waiting to be delivered to the user") {
                     todo!("Reassemble remaining data into RCV buffer");
                     todo!("Signal user to read recv buffer");
-                    Res::empty()
                 } else {
-                    Res::error(Error::ConnectionClosing)
+                    Err(Error::ConnectionClosing)
                 }
-            },
+            }
             ConnectionState::Closing | ConnectionState::TimeWait | ConnectionState::LastAck => {
-                Res::error(Error::ConnectionClosing)
-            },
-            ConnectionState::Closed => Res::error(Error::NotConnected),
+                Err(Error::ConnectionClosing)
+            }
+            ConnectionState::Closed => Err(Error::NotConnected),
         }
     }
 
     /// Request closing the socket
-    pub fn call_close(&mut self) -> Res {
+    pub fn call_close(&mut self) -> Result<(), Error> {
         dbg!(self.connection_state);
         log::trace!("call_close");
         match self.connection_state {
@@ -433,8 +492,8 @@ impl Socket {
                     todo!("Send ConnectionClosing to the RECVs");
                 }
                 self.clear();
-                Res::empty()
-            },
+                Ok(())
+            }
             ConnectionState::SynReceived => {
                 let new_sends = todo!("New sends");
                 let queued_sends = todo!("Queued sends");
@@ -450,9 +509,9 @@ impl Socket {
                         flags: SegmentFlags::FIN,
                         data: Vec::new(),
                     });
-                    Res::empty()
+                    Ok(())
                 }
-            },
+            }
             ConnectionState::Established => {
                 let queued_sends = todo!("Queued sends");
                 if queued_sends {
@@ -468,13 +527,13 @@ impl Socket {
                     flags: SegmentFlags::FIN,
                     data: Vec::new(),
                 });
-                Res::empty()
-            },
+                Ok(())
+            }
             ConnectionState::FinWait1
             | ConnectionState::FinWait2
             | ConnectionState::Closing
             | ConnectionState::TimeWait
-            | ConnectionState::LastAck => Res::error(Error::ConnectionClosing),
+            | ConnectionState::LastAck => Err(Error::ConnectionClosing),
             ConnectionState::CloseWait => {
                 if todo!("any queued SENDs") {
                     todo!("queue this close until all sent");
@@ -487,14 +546,14 @@ impl Socket {
                     flags: SegmentFlags::FIN,
                     data: Vec::new(),
                 });
-                Res::empty()
-            },
-            ConnectionState::Closed => Res::error(Error::NotConnected),
+                Ok(())
+            }
+            ConnectionState::Closed => Err(Error::NotConnected),
         }
     }
 
     /// Request closing the socket
-    pub fn call_abort(&mut self) -> Res {
+    pub fn call_abort(&mut self) -> Result<(), Error> {
         dbg!(self.connection_state);
         log::trace!("call_abort");
         match self.connection_state {
@@ -504,8 +563,8 @@ impl Socket {
                     todo!("Send ConnectionReset to the RECVs");
                 }
                 self.clear();
-                Res::empty()
-            },
+                Ok(())
+            }
             ConnectionState::SynReceived
             | ConnectionState::Established
             | ConnectionState::FinWait1
@@ -518,37 +577,125 @@ impl Socket {
                     flags: SegmentFlags::RST,
                     data: Vec::new(),
                 });
-                let mut r = Res::empty();
+                let mut r = Ok(());
 
                 let queued_sends = todo!("Queued sends");
                 let queued_recvs = todo!("Queued recvs");
                 if queued_sends || queued_recvs {
-                    r.error = Some(Error::ConnectionReset);
+                    r = Err(Error::ConnectionReset);
                 }
 
                 self.clear();
                 r
-            },
+            }
             ConnectionState::Closing | ConnectionState::LastAck | ConnectionState::TimeWait => {
                 self.clear();
-                Res::empty()
-            },
-            ConnectionState::Closed => Res::error(Error::NotConnected),
+                Ok(())
+            }
+            ConnectionState::Closed => Err(Error::NotConnected),
         }
     }
 
+    /// Handles packets valid ACKs (including those with duplicates)
+    /// Section ES3 in the PDF
+    fn handle_received(&mut self, seg: SegmentMeta) -> Result<(), Error> {
+        assert!(seg.seqn >= self.rx_seq.next); // TODO: wrapping
+        log::trace!("handle_received");
+        let has_fin = seg.flags.contains(SegmentFlags::FIN);
+
+        if seg.seqn == self.rx_seq.next {
+            log::trace!("This packet is in-order");
+            // Add seg to user-readable buffer
+            let len = seg.data.len();
+            self.buffers.readable.push_back(seg.data);
+            self.rx_seq.next = seg.seqn.wrapping_add(len as u32);
+
+            // Process out-of-order packets
+            if !self.buffers.oo_rx.is_empty() {
+                todo!("out-of-order packets");
+            }
+
+            // todo!("signal: Data readable");
+            log::trace!("Data readable");
+        } else {
+            panic!("This packet is out-of-order");
+            let len = seg.data.len();
+            self.buffers.oo_rx.push_back(seg);
+            self.rx_seq.window += len as u16;
+        }
+
+        dbg!(self.tx_seq.next, self.rx_seq.next);
+
+        self.buffers.send_now.push_back(SegmentMeta {
+            seqn: self.tx_seq.next,
+            ackn: self.rx_seq.next,
+            window: self.rx_seq.window,
+            flags: SegmentFlags::ACK,
+            data: Vec::new(),
+        });
+
+        if has_fin {
+            todo!("FIN bit processing");
+            self.connection_state = ConnectionState::CloseWait;
+        }
+
+        Ok(())
+    }
+
     /// Called on incoming segment
-    pub fn on_segment(&mut self, seg: SegmentMeta) -> Res {
+    /// See RFC 793 page 64
+    pub fn on_segment(&mut self, seg: SegmentMeta) -> Result<(), Error> {
         dbg!(self.connection_state);
         log::trace!("on_segment {:?}", seg);
 
-        self.tx_seq.window = seg.window.min(self.congestation_window);
+        if self.connection_state == ConnectionState::Closed {
+            self.buffers.send_now.push_back(response_to_closed(seg));
+            return Ok(());
+        } else if self.connection_state == ConnectionState::Listen {
+            if seg.flags.contains(SegmentFlags::RST) {
+                return Ok(());
+            }
 
-        match self.connection_state {
-            ConnectionState::Listen => {
+            if seg.flags.contains(SegmentFlags::ACK) {
+                self.buffers.send_now.push_back(SegmentMeta {
+                    seqn: seg.ackn,
+                    ackn: 0,
+                    window: 0,
+                    flags: SegmentFlags::RST,
+                    data: Vec::new(),
+                });
+                return Ok(());
+            }
+
+            if !seg.flags.contains(SegmentFlags::SYN) {
+                log::warn!("Invalid packet received, dropping");
+                return Ok(());
+            }
+
+            // TODO: Store remote peer address
+            self.rx_seq.next = seg.seqn.wrapping_add(1);
+            self.rx_seq.init_seqn = seg.seqn;
+            // TODO: queue data, control if any available
+            assert!(seg.data.len() == 0, "TODO");
+            let seqn = random_seqnum();
+            self.tx_seq.next = seqn.wrapping_add(1);
+            self.tx_seq.unack = seqn;
+            self.connection_state = ConnectionState::SynReceived;
+            self.buffers.send_now.push_back(SegmentMeta {
+                seqn,
+                ackn: self.rx_seq.next,
+                window: self.rx_seq.window,
+                flags: SegmentFlags::SYN | SegmentFlags::ACK,
+                data: Vec::new(),
+            });
+            return Ok(());
+        } else if self.connection_state == ConnectionState::SynSent {
+            let ack_acceptable = if seg.flags.contains(SegmentFlags::ACK) {
                 if seg.flags.contains(SegmentFlags::RST) {
-                    todo!();
-                } else if seg.flags.contains(SegmentFlags::ACK) {
+                    return Ok(());
+                }
+
+                if seg.ackn <= self.tx_seq.init_seqn || seg.ackn > self.tx_seq.next {
                     self.buffers.send_now.push_back(SegmentMeta {
                         seqn: seg.ackn,
                         ackn: 0,
@@ -556,520 +703,281 @@ impl Socket {
                         flags: SegmentFlags::RST,
                         data: Vec::new(),
                     });
-                    Res::empty()
-                } else if !seg.flags.contains(SegmentFlags::SYN) {
-                    todo!();
+                    return Ok(());
+                }
+
+                seg.ackn <= self.tx_seq.unack || seg.ackn <= self.tx_seq.next
+            } else {
+                false
+            };
+
+            if seg.flags.contains(SegmentFlags::RST) {
+                return if ack_acceptable {
+                    self.clear();
+                    Err(Error::ConnectionReset)
                 } else {
-                    // SYN packet
-                    self.rx_seq.next = seg.seqn.wrapping_add(1);
-                    self.rx_seq.init_seqn = seg.seqn;
-                    let seqn = random_seqnum();
-                    self.tx_seq.next = seqn.wrapping_add(1);
-                    self.tx_seq.unack = seqn;
-                    self.connection_state = ConnectionState::SynReceived;
+                    Ok(())
+                };
+            }
+
+            if seg.flags.contains(SegmentFlags::SYN) {
+                self.rx_seq.next = seg.seqn.wrapping_add(1);
+                self.rx_seq.init_seqn = seg.seqn;
+                self.clear_re_tx_range(self.tx_seq.unack, seg.ackn);
+                self.tx_seq.unack = seg.ackn;
+                if self.tx_seq.unack > self.tx_seq.init_seqn {
+                    // Our SYN has been ACK'd
+                    self.connection_state = ConnectionState::Established;
+                    // TODO: optimization: include queued data or controls here
                     self.buffers.send_now.push_back(SegmentMeta {
-                        seqn,
+                        seqn: self.tx_seq.next,
                         ackn: self.rx_seq.next,
                         window: self.rx_seq.window,
-                        flags: SegmentFlags::SYN | SegmentFlags::ACK,
+                        flags: SegmentFlags::ACK,
                         data: Vec::new(),
                     });
-                    Res::empty()
-                }
-            },
-            ConnectionState::SynSent => {
-                if seg.flags.contains(SegmentFlags::ACK) {
-                    let cond1 = seg.ackn <= self.tx_seq.init_seqn || seg.ackn > self.tx_seq.next;
-                    let cond2 = seg.ackn <= self.tx_seq.unack || seg.ackn <= self.tx_seq.next;
-
-                    if cond1 || (!cond2) {
-                        // ACK not acceptable
-                        self.buffers.send_now.push_back(SegmentMeta {
-                            seqn: seg.ackn,
-                            ackn: 0,
-                            window: self.rx_seq.window,
-                            flags: SegmentFlags::RST,
-                            data: Vec::new(),
-                        });
-                        Res::empty()
-                    } else if seg.flags.contains(SegmentFlags::RST) {
-                        self.clear();
-                        return Res::error(Error::ConnectionReset);
-                    } else if seg.flags.contains(SegmentFlags::SYN) {
-                        self.rx_seq.next = seg.seqn.wrapping_add(1);
-                        self.rx_seq.init_seqn = seg.seqn;
-                        self.clear_re_tx_range(self.tx_seq.unack, seg.ackn);
-                        self.tx_seq.unack = seg.ackn;
-                        if self.tx_seq.unack <= self.tx_seq.init_seqn {
-                            todo!("If packet has data, queue it until ESTABLISHED");
-                            self.connection_state = ConnectionState::SynReceived;
-                            self.buffers.send_now.push_back(SegmentMeta {
-                                seqn: self.tx_seq.init_seqn,
-                                ackn: self.rx_seq.next,
-                                window: self.rx_seq.window,
-                                flags: SegmentFlags::ACK,
-                                data: Vec::new(),
-                            });
-                            Res::empty()
-                        } else {
-                            dbg!("EXEC");
-                            // Our SYN has been ACK'd
-                            self.connection_state = ConnectionState::Established;
-                            // TODO: optimization: include queued data or controls here
-                            self.buffers.send_now.push_back(SegmentMeta {
-                                seqn: self.tx_seq.next,
-                                ackn: self.rx_seq.next,
-                                window: self.rx_seq.window,
-                                flags: SegmentFlags::ACK,
-                                data: Vec::new(),
-                            });
-                            Res::empty()
-                        }
-                    } else {
-                        Res::empty()
-                    }
-                } else if seg.flags.contains(SegmentFlags::RST) {
-                    Res::empty()
-                } else if seg.flags.contains(SegmentFlags::SYN) {
+                } else {
                     todo!("If packet has data, queue it until ESTABLISHED");
                     self.connection_state = ConnectionState::SynReceived;
                     self.buffers.send_now.push_back(SegmentMeta {
                         seqn: self.tx_seq.init_seqn,
                         ackn: self.rx_seq.next,
                         window: self.rx_seq.window,
-                        flags: SegmentFlags::ACK,
+                        flags: SegmentFlags::SYN | SegmentFlags::ACK,
                         data: Vec::new(),
                     });
-                    Res::empty()
-                } else {
-                    Res::empty()
                 }
-            },
-            ConnectionState::SynReceived => {
-                if self.check_segment_seq_ok(&seg) {
-                    if seg.flags.contains(SegmentFlags::RST) {
-                        // TODO: prevstate ?= LISTEN
-                        todo!("clear rexmt queue");
-                        self.connection_state = ConnectionState::Listen;
-                        Res::empty()
-                    } else if seg.flags.contains(SegmentFlags::SYN) {
-                        log::warn!("Peer error: SYN");
-                        // Error! Send reset, flush all queues
-                        self.buffers.send_now.push_back(SegmentMeta {
-                            seqn: self.tx_seq.next,
-                            ackn: 0,
-                            window: self.rx_seq.window,
-                            flags: SegmentFlags::RST,
-                            data: Vec::new(),
-                        });
-                        let mut r = Res::empty();
-                        let queued_sends = todo!("Queued sends");
-                        let queued_recvs = todo!("Queued recvs");
-                        if queued_sends || queued_recvs {
-                            r.error = Some(Error::ConnectionReset);
-                        }
-                        self.clear();
-                        r
-                    } else if seg.flags.contains(SegmentFlags::ACK) {
-                        dbg!(self.tx_seq.unack, seg.ackn, seg.ackn, self.tx_seq.next);
-                        if self.tx_seq.unack <= seg.ackn && seg.ackn <= self.tx_seq.next {
-                            self.connection_state = ConnectionState::Established;
-                            self.on_segment(seg) // recurse
-                        } else if seg.flags.contains(SegmentFlags::FIN) {
-                            todo!("FIN BIT PROCESSING");
-                            self.connection_state = ConnectionState::CloseWait;
-                            Res::empty()
-                        } else {
-                            log::warn!("Peer error");
-                            todo!("Peer error");
-                            // Error! Send a reset and flush all seg queues
-                            self.buffers.send_now.push_back(SegmentMeta {
-                                seqn: self.tx_seq.next,
-                                ackn: 0,
-                                window: self.rx_seq.window,
-                                flags: SegmentFlags::RST,
-                                data: Vec::new(),
-                            });
-                            let mut r = Res::empty();
-                            let queued_sends = todo!("Queued sends");
-                            let queued_recvs = todo!("Queued recvs");
-                            if queued_sends || queued_recvs {
-                                r.error = Some(Error::ConnectionReset);
-                            }
-                            self.clear();
-                            r
-                        }
-                    } else {
-                        // ACK bit is off! Drop segment and return
-                        Res::empty()
-                    }
-                } else if seg.flags.contains(SegmentFlags::RST) {
-                    Res::empty()
-                } else {
-                    self.buffers.send_now.push_back(SegmentMeta {
-                        seqn: self.tx_seq.next,
-                        ackn: self.rx_seq.next,
-                        window: self.rx_seq.window,
-                        flags: SegmentFlags::ACK,
-                        data: Vec::new(),
-                    });
-                    Res::empty()
-                }
-            },
-            ConnectionState::Established => {
-                if self.check_segment_seq_ok(&seg) {
-                    log::trace!("Established check_segment_seq_ok");
-                    if seg.flags.contains(SegmentFlags::RST) {
-                        let queued_sends = todo!("Queued sends");
-                        let queued_recvs = todo!("Queued recvs");
-                        let mut r = Res::empty();
-                        if queued_sends || queued_recvs {
-                            r.error = Some(Error::ConnectionReset);
-                        }
-                        self.clear();
-                        r
-                    } else if seg.flags.contains(SegmentFlags::SYN) {
-                        let mut r = self.buffers.send_now.push_back(SegmentMeta {
-                            seqn: self.tx_seq.next,
-                            ackn: self.rx_seq.next,
-                            window: self.rx_seq.window,
-                            flags: SegmentFlags::ACK,
-                            data: Vec::new(),
-                        });
-                        let mut r = Res::empty();
-                        let queued_sends = todo!("Queued sends");
-                        let queued_recvs = todo!("Queued recvs");
-                        if queued_sends || queued_recvs {
-                            r.error = Some(Error::ConnectionReset);
-                        }
-                        self.clear();
-                        r
-                    // <ES2>
-                    } else if seg.flags.contains(SegmentFlags::ACK) {
-                        if self.tx_seq.unack < seg.ackn && seg.ackn <= self.tx_seq.next {
-                            // New valid ACK
+            }
 
-                            // Window update subroutine
-                            if self.dup_ack_count > 0 {
-                                self.congestation_window = SLOW_START_TRESHOLD;
-                            } else if self.congestation_window <= SLOW_START_TRESHOLD {
-                                self.congestation_window *= 2;
-                            } else {
-                                self.congestation_window += seg.data.len() as u16; // TODO: cast better
-                            }
-
-                            // End of window update
-                            self.tx_seq.window = seg.window.min(self.congestation_window);
-
-                            self.clear_re_tx_range(self.tx_seq.unack, seg.ackn);
-                            self.tx_seq.unack = seg.ackn;
-                            self.exp_backoff = 1;
-                            self.timers.re_tx = None;
-
-                            let has_fin = seg.flags.contains(SegmentFlags::FIN);
-
-                            // <ES3>
-                            let r = if seg.seqn == self.rx_seq.next {
-                                // Add seg to user-readable buffer
-                                let len = seg.data.len();
-                                self.buffers.rx.push_back(seg.data);
-                                self.rx_seq.next = seg.seqn.wrapping_add(len as u32);
-
-                                // Process out-of-order packets
-                                if !self.buffers.oo_rx.is_empty() {
-                                    todo!("out-of-order packets");
-                                }
-                                // todo!("signal: Data readable");
-                                self.buffers.send_now.push_back(SegmentMeta {
-                                    seqn: self.tx_seq.next,
-                                    ackn: self.rx_seq.next,
-                                    window: self.rx_seq.window,
-                                    flags: SegmentFlags::ACK,
-                                    data: Vec::new(),
-                                });
-                                Res::empty()
-                            } else {
-                                let len = seg.data.len();
-                                self.buffers.oo_rx.push_back(seg);
-                                self.rx_seq.window += len as u16;
-                                self.buffers.send_now.push_back(SegmentMeta {
-                                    seqn: self.tx_seq.next,
-                                    ackn: self.rx_seq.next,
-                                    window: self.rx_seq.window,
-                                    flags: SegmentFlags::ACK,
-                                    data: Vec::new(),
-                                });
-                                Res::empty()
-                            };
-
-                            if has_fin {
-                                todo!("FIN bit processing");
-                                self.connection_state = ConnectionState::CloseWait;
-                            }
-                            r
-                            // </ES3>
-                        } else if seg.ackn != self.tx_seq.unack {
-                            // Invalid ACK, drop!
-                            log::warn!("Dropping packet with invalid ACK value");
-                            Res::empty()
-                        } else {
-                            // Duplicate ACK
-                            self.dup_ack_count += 1;
-                            if self.dup_ack_count > 2 {
-                                // Fast recovery
-                                todo!("Fast recovery");
-                                // return self.fast_recovery();
-                            } else if self.dup_ack_count == 2 {
-                                // Fast retransmit
-                                todo!("Fast retransmit");
-                                // self.timers.re_tx = None;
-                            }
-                            // self.handle_received();
-                            todo!("ES3");
-                        }
-                    } else {
-                        // ACK bit is off! Drop segment and return
-                        log::warn!("Invalid packet, ACK is off");
-                        Res::empty()
-                    }
-                } else if seg.flags.contains(SegmentFlags::RST) {
-                    Res::empty()
-                } else {
-                    self.buffers.send_now.push_back(SegmentMeta {
-                        seqn: self.tx_seq.next,
-                        ackn: self.rx_seq.next,
-                        window: self.rx_seq.window,
-                        flags: SegmentFlags::ACK,
-                        data: Vec::new(),
-                    });
-                    Res::empty()
-                }
-            },
-            ConnectionState::FinWait1 => {
-                if self.check_segment_seq_ok(&seg) {
-                    if seg.flags.contains(SegmentFlags::RST)
-                        || seg.flags.contains(SegmentFlags::SYN)
-                    {
-                        let mut r = self.buffers.send_now.push_back(SegmentMeta {
-                            seqn: self.tx_seq.next,
-                            ackn: 0,
-                            window: self.rx_seq.window,
-                            flags: SegmentFlags::RST,
-                            data: Vec::new(),
-                        });
-
-                        let mut r = Res::empty();
-                        let queued_sends = todo!("Queued sends");
-                        let queued_recvs = todo!("Queued recvs");
-                        if queued_sends || queued_recvs {
-                            r.error = Some(Error::ConnectionReset);
-                        }
-
-                        self.clear();
-                        r
-                    } else if seg.flags.contains(SegmentFlags::ACK) {
-                        let ack_valid =
-                            self.tx_seq.unack < seg.ackn && seg.ackn <= self.tx_seq.next;
-                        // Ignore duplicate/invalid ACKs, lost segments are retx'd using timeout
-                        if ack_valid {
-                            todo!("window update");
-                            todo!("wnd");
-                            todo!("Remove from rexmt queue all fully ACK'd segments");
-                            todo!("Release REXMT timer");
-                        }
-
-                        let r = if seg.seqn == self.rx_seq.next {
-                            if todo!("out-of-order buffer empty") {
-                                todo!("Copy incoming seg data to RCV buffer");
-                                self.rx_seq.next = seg.seqn.wrapping_add(seg.data.len() as u32);
-                            } else {
-                                // Lost segment found
-                                todo!("Drain out-of-order recv buffer to normal recv buffer");
-                                // NOTE: HSEG = segment with highest seqn recv'd so far
-                                todo!("rcv.nxt = hseg.seg + hseg.len");
-                            }
-                            todo!("Signal user data ready recv");
-                            self.buffers.send_now.push_back(SegmentMeta {
-                                seqn: self.tx_seq.next,
-                                ackn: self.rx_seq.next,
-                                window: self.rx_seq.window,
-                                flags: SegmentFlags::ACK,
-                                data: Vec::new(),
-                            });
-                            Res::empty()
-                        } else {
-                            todo!("Add recv'd data to out-of-order recv buffer");
-                            todo!("self.rx_seq.window = RECV.WIND + seg.len");
-                            self.buffers.send_now.push_back(SegmentMeta {
-                                seqn: self.tx_seq.next,
-                                ackn: self.rx_seq.next,
-                                window: self.rx_seq.window,
-                                flags: SegmentFlags::ACK,
-                                data: Vec::new(),
-                            });
-                            Res::empty()
-                        };
-
-                        if todo!("seg.ack acknowledges our FIN?") {
-                            if seg.flags.contains(SegmentFlags::FIN) {
-                                todo!("FIN bit processing");
-                                todo!("Turn off all timers");
-                                todo!("Set timeout");
-                                self.connection_state = ConnectionState::TimeWait;
-                            } else {
-                                self.connection_state = ConnectionState::FinWait2;
-                            }
-                        } else {
-                            if seg.flags.contains(SegmentFlags::FIN) {
-                                todo!("FIN bit processing");
-                                self.connection_state = ConnectionState::Closing;
-                            }
-                        }
-                        r
-                    } else {
-                        Res::empty()
-                    }
-                } else if seg.flags.contains(SegmentFlags::RST) {
-                    Res::empty()
-                } else {
-                    self.buffers.send_now.push_back(SegmentMeta {
-                        seqn: self.tx_seq.next,
-                        ackn: self.rx_seq.next,
-                        window: self.rx_seq.window,
-                        flags: SegmentFlags::ACK,
-                        data: Vec::new(),
-                    });
-                    Res::empty()
-                }
-            },
-            ConnectionState::FinWait2 => {
-                if self.check_segment_seq_ok(&seg) {
-                    if seg.flags.contains(SegmentFlags::RST)
-                        || seg.flags.contains(SegmentFlags::SYN)
-                    {
-                        self.buffers.send_now.push_back(SegmentMeta {
-                            seqn: self.tx_seq.next,
-                            ackn: 0,
-                            window: self.rx_seq.window,
-                            flags: SegmentFlags::RST,
-                            data: Vec::new(),
-                        });
-                        let mut r = Res::empty();
-
-                        let queued_sends = todo!("Queued sends");
-                        let queued_recvs = todo!("Queued recvs");
-                        if queued_sends || queued_recvs {
-                            r.error = Some(Error::ConnectionReset);
-                        }
-
-                        self.clear();
-                        r
-                    } else if seg.flags.contains(SegmentFlags::ACK) {
-                        todo!("Copy here from FinWait1 (this is FWT2)");
-                        if seg.flags.contains(SegmentFlags::FIN) {
-                            todo!("FIN bit processing");
-                            todo!("Turn off all timers");
-                            todo!("Set timeout 2MSL");
-                            self.connection_state = ConnectionState::TimeWait;
-                            Res::empty()
-                        } else {
-                            Res::empty()
-                        }
-                    } else {
-                        Res::empty()
-                    }
-                } else if seg.flags.contains(SegmentFlags::RST) {
-                    Res::empty()
-                } else {
-                    self.buffers.send_now.push_back(SegmentMeta {
-                        seqn: self.tx_seq.next,
-                        ackn: self.rx_seq.next,
-                        window: self.rx_seq.window,
-                        flags: SegmentFlags::ACK,
-                        data: Vec::new(),
-                    });
-                    Res::empty()
-                }
-            },
-            ConnectionState::CloseWait => {
-                todo!();
-            },
-            ConnectionState::Closing | ConnectionState::TimeWait => {
-                if self.check_segment_seq_ok(&seg) {
-                    if seg.flags.contains(SegmentFlags::RST) {
-                        self.clear();
-                        Res::empty()
-                    } else if seg.flags.contains(SegmentFlags::SYN) {
-                        self.buffers.send_now.push_back(SegmentMeta {
-                            seqn: self.tx_seq.next,
-                            ackn: 0,
-                            window: self.rx_seq.window,
-                            flags: SegmentFlags::RST,
-                            data: Vec::new(),
-                        });
-
-                        let mut r = Res::empty();
-                        let queued_sends = todo!("Queued sends");
-                        let queued_recvs = todo!("Queued recvs");
-                        if queued_sends || queued_recvs {
-                            r.error = Some(Error::ConnectionReset);
-                        }
-
-                        self.clear();
-                        r
-                    } else {
-                        if seg.flags.contains(SegmentFlags::ACK)
-                            && (self.tx_seq.unack < seg.ackn && seg.ackn < self.tx_seq.next)
-                            && todo!("our FIN has been ACK'd")
-                        {
-                            todo!("Turn off all timers");
-                            todo!("Set timer 2MSL");
-                            self.connection_state = ConnectionState::TimeWait;
-                        }
-                        Res::empty()
-                    }
-                } else if seg.flags.contains(SegmentFlags::RST) {
-                    Res::empty()
-                } else {
-                    self.buffers.send_now.push_back(SegmentMeta {
-                        seqn: self.tx_seq.next,
-                        ackn: self.rx_seq.next,
-                        window: self.rx_seq.window,
-                        flags: SegmentFlags::ACK,
-                        data: Vec::new(),
-                    });
-                    Res::empty()
-                }
-            },
-            ConnectionState::LastAck => {
-                todo!();
-            },
-            ConnectionState::Closed => {
-                if seg.flags.contains(SegmentFlags::ACK) {
-                    self.buffers.send_now.push_back(SegmentMeta {
-                        seqn: seg.seqn + seg.data.len() as u32,
-                        ackn: 0,
-                        window: self.rx_seq.window,
-                        flags: SegmentFlags::RST | SegmentFlags::ACK,
-                        data: Vec::new(),
-                    });
-                    Res::empty()
-                } else {
-                    self.buffers.send_now.push_back(SegmentMeta {
-                        seqn: seg.ackn,
-                        ackn: 0,
-                        window: self.rx_seq.window,
-                        flags: SegmentFlags::RST,
-                        data: Vec::new(),
-                    });
-                    Res::empty()
-                }
-            },
+            return Ok(());
         }
+
+        // Acceptability check (RFC 793 page 36 and 68)
+        // TODO: process valid ACKs and RSTs even if receive_window == 0?
+        if !self.check_segment_seq_ok(&seg) {
+            if !seg.flags.contains(SegmentFlags::RST) {
+                self.buffers.send_now.push_back(SegmentMeta {
+                    seqn: self.tx_seq.next,
+                    ackn: self.rx_seq.next,
+                    window: self.rx_seq.window,
+                    flags: SegmentFlags::ACK,
+                    data: Vec::new(),
+                });
+            }
+            return Ok(());
+        }
+
+        // self.tx_seq.window = seg.window.min(self.congestation_window);
+
+        // if self.connection_state != ConnectionState::SynSent
+        //     && seg.flags.contains(SegmentFlags::RST)
+        // {
+        //     todo!("RFC 793 page 36 Reset processing");
+        // }
+
+        if seg.flags.contains(SegmentFlags::RST) {
+            match self.connection_state {
+                ConnectionState::SynReceived => {
+                    todo!("If actively connecting, error ConnectionRefused");
+                    self.clear();
+                    self.connection_state = ConnectionState::Listen;
+                }
+                ConnectionState::Established
+                | ConnectionState::FinWait1
+                | ConnectionState::FinWait2
+                | ConnectionState::CloseWait => {
+                    todo!("Pending RECV/SEND calls: signal error ConnectionReset");
+                    self.clear();
+                    todo!("Return error?");
+                }
+                ConnectionState::Closing | ConnectionState::LastAck | ConnectionState::TimeWait => {
+                    self.clear();
+                }
+                _ => unreachable!(),
+            }
+            return Ok(());
+        }
+
+        if seg.flags.contains(SegmentFlags::SYN) {
+            log::warn!("Peer error: SYN");
+
+            todo!("Pending RECV/SEND calls: signal error ConnectionReset");
+
+            // Error! Send reset, flush all queues
+            self.buffers.send_now.push_back(SegmentMeta {
+                seqn: self.tx_seq.next,
+                ackn: 0,
+                window: self.rx_seq.window,
+                flags: SegmentFlags::RST,
+                data: Vec::new(),
+            });
+
+            todo!("Return error?");
+        }
+
+        if !seg.flags.contains(SegmentFlags::ACK) {
+            return Ok(());
+        }
+
+        if self.connection_state == ConnectionState::LastAck {
+            todo!("Check for our FIN ack");
+            self.clear();
+            return Ok(());
+        }
+
+        if self.connection_state == ConnectionState::TimeWait {
+            todo!("Is this FIN?");
+            todo!("Ack FIN");
+            todo!("Restart MSL 2 timeout");
+            return Ok(());
+        }
+
+        if self.connection_state == ConnectionState::SynReceived {
+            // TODO: wrapping
+            if self.tx_seq.unack <= seg.ackn && seg.ackn <= self.tx_seq.next {
+                self.connection_state = ConnectionState::Established;
+            }
+            // TODO: should we return here?
+            dbg!("cont ConnectionState::SynReceived");
+        }
+
+        if seg.ackn < self.tx_seq.unack || seg.ackn > self.tx_seq.next {
+            log::warn!("Dropping invalid ACK");
+            return Ok(());
+        }
+
+        if seg.ackn == self.tx_seq.unack {
+            // Duplicate ACK for an old segment
+            self.dup_ack_count += 1;
+            log::trace!("new duplicate, count={}", self.dup_ack_count);
+            if self.dup_ack_count > 2 {
+                // Fast recovery
+                todo!("Fast recovery");
+            } else if self.dup_ack_count == 2 {
+                // Fast retransmit
+                todo!("Fast retransmit");
+            }
+        } else {
+            // New valid ACK
+            debug_assert!(self.tx_seq.unack < seg.ackn && seg.ackn <= self.tx_seq.next);
+
+            // Window update subroutine
+            if self.dup_ack_count > 0 {
+                self.congestation_window = SLOW_START_TRESHOLD;
+            } else if self.congestation_window <= SLOW_START_TRESHOLD {
+                self.congestation_window *= 2;
+            } else {
+                // TODO: cast better
+                self.congestation_window += seg.data.len() as u16;
+            }
+
+            // End of window update
+            self.tx_seq.window = seg.window.min(self.congestation_window);
+
+            self.clear_re_tx_range(self.tx_seq.unack, seg.ackn);
+            self.tx_seq.unack = seg.ackn;
+            self.exp_backoff = 1;
+            self.timers.re_tx = None;
+
+            self.trigger(|waitfor| {
+                if let WaitFor::SendAck { seqn } = waitfor {
+                    seqn <= seg.ackn
+                } else {
+                    false
+                }
+            });
+        }
+
+        if self.connection_state == ConnectionState::FinWait1 {
+            todo!("Has our FIN been ack'd?");
+            self.connection_state = ConnectionState::FinWait2;
+        }
+
+        if self.connection_state == ConnectionState::FinWait2 {
+            todo!("If user has pending CLOSE call, that can return now");
+        }
+
+        if self.connection_state == ConnectionState::Closing {
+            if todo!("Has our FIN been ack'd?") {
+                self.connection_state = ConnectionState::TimeWait;
+            }
+        }
+
+        let has_fin = seg.flags.contains(SegmentFlags::FIN);
+
+        // Process segment data, if any
+        if !seg.data.is_empty() {
+            match self.connection_state {
+                ConnectionState::Established
+                | ConnectionState::FinWait1
+                | ConnectionState::FinWait2 => {
+                    // TODO: PSH flag handling
+
+                    let len = seg.data.len() as u32;
+                    self.handle_received(seg);
+                    // self.rx_seq.next = self.rx_seq.next.wrapping_add(len);
+                    // TODO: adjust self.rx_seq.window
+                    //       The total of RCV.NXT and RCV.WND should not be reduced.
+
+                    // TODO: optimization: piggyback the ack into some data if possible
+                    log::trace!("ACK'ing incoming data");
+                    self.buffers.send_now.push_back(SegmentMeta {
+                        seqn: self.tx_seq.next,
+                        ackn: self.rx_seq.next,
+                        window: self.rx_seq.window,
+                        flags: SegmentFlags::ACK,
+                        data: Vec::new(),
+                    })
+                }
+                other => {
+                    log::warn!("Peer error: sends data after FIN");
+                }
+            }
+        }
+
+        if matches!(
+            self.connection_state,
+            ConnectionState::Closed | ConnectionState::Listen | ConnectionState::SynSent
+        ) {
+            return Ok(());
+        }
+
+        if has_fin {
+            todo!("Singal user: ConnectionClosing");
+            todo!("Singal pending recvs: ConnectionClosing");
+
+            todo!("FIN bit processing");
+
+            match self.connection_state {
+                ConnectionState::SynReceived | ConnectionState::Established => {
+                    self.connection_state = ConnectionState::CloseWait;
+                }
+                ConnectionState::FinWait1 => {
+                    if todo!("Has our FIN been ACK'd (this segment or otherwise?)") {
+                        self.connection_state = ConnectionState::TimeWait;
+                        todo!("Turn off timers");
+                        todo!("Time-wait timer setup");
+                    } else {
+                        self.connection_state = ConnectionState::Closing;
+                    }
+                }
+                ConnectionState::FinWait2 => {
+                    self.connection_state = ConnectionState::TimeWait;
+                    todo!("Turn off timers");
+                    todo!("Time-wait timer setup");
+                }
+                ConnectionState::TimeWait => {
+                    todo!("Restart 2MSL time-wait timeout");
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
     }
 
     /// Called on timeout segment
-    pub fn on_timeout(&mut self) -> Res {
+    pub fn on_timeout(&mut self) -> Result<(), Error> {
         dbg!(self.connection_state);
         log::trace!("on_timeout");
         todo!();
