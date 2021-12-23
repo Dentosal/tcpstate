@@ -1,0 +1,19 @@
+[package]
+name = "tcpstate"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+std = []
+
+[dependencies]
+bitflags = "1.2"
+log = "0.4"
+
+[dev-dependencies]
+# Tests
+stderrlog = "0.5"
+
+# Examples
+#pnet = "0.28"
