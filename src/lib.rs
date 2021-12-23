@@ -17,7 +17,7 @@ mod event;
 mod result;
 mod segment;
 
-use event::WaitFor;
+use event::WaitUntil;
 
 pub use event::Cookie;
 pub use result::Error;
@@ -69,6 +69,7 @@ const NAGLE_DELAY_DEFAULT: Duration = Duration::from_millis(200);
 
 // TODO: move these constants to a config parameter?
 
+pub const MAX_SEGMENT_LIFETIME: Duration = Duration::from_secs(120);
 const INITIAL_WINDOW_SIZE: u16 = 0x1000;
 const MAX_SEGMENT_SIZE: usize = 512;
 const SLOW_START_TRESHOLD: u16 = 512;
@@ -223,6 +224,11 @@ pub struct Timers {
     timewait: Option<Instant>,
     usertime: Option<Instant>,
 }
+impl Timers {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Socket {
@@ -236,7 +242,8 @@ pub struct Socket {
     buffers: Buffers,
     timings: Timings,
     timers: Timers,
-    pending: Vec<(WaitFor, Cookie)>,
+    pending: Vec<(WaitUntil, Cookie)>,
+    next_cookie: Cookie,
     pub options: SocketOptions,
 }
 
@@ -255,17 +262,45 @@ impl Socket {
             timings: Timings::default(),
             timers: Timers::default(),
             pending: Vec::new(),
+            next_cookie: Cookie::ZERO,
             options: SocketOptions::default(),
         }
     }
 
+    pub fn state(&self) -> ConnectionState {
+        self.connection_state
+    }
+
+    /// All state accesses are done using this so they can be logged
+    fn set_state(&mut self, state: ConnectionState) {
+        log::trace!("State {:?} => {:?}", self.connection_state, state);
+        self.connection_state = state;
+    }
+
     fn clear(&mut self) {
+        log::trace!(
+            "Clear: State {:?} => {:?}",
+            self.connection_state,
+            ConnectionState::Closed
+        );
         *self = Self::new();
+    }
+
+    fn new_cookie(&mut self) -> Cookie {
+        let result = self.next_cookie;
+        self.next_cookie = self.next_cookie.next();
+        result
+    }
+
+    fn return_retry_after<T>(&mut self, until: WaitUntil) -> Result<T, Error> {
+        let cookie = self.new_cookie();
+        self.pending.push((until, cookie));
+        Err(Error::RetryAfter(cookie))
     }
 
     fn trigger<F>(&mut self, f: F)
     where
-        F: Fn(WaitFor) -> bool,
+        F: Fn(WaitUntil) -> bool,
     {
         for (_, cookie) in self.pending.drain_filter(|(wait, _)| f(*wait)) {
             todo!("Trigger cookie {:?}", cookie);
@@ -274,6 +309,7 @@ impl Socket {
 
     /// RFC793, page 25
     fn check_segment_seq_ok(&self, seg: &SegmentMeta) -> bool {
+        dbg!(&self.rx_seq);
         if self.rx_seq.window == 0 {
             seg.data.len() == 0 && seg.seqn == self.rx_seq.next
         } else {
@@ -350,11 +386,11 @@ impl Socket {
 
     /// Establish a connection
     pub fn call_connect(&mut self, remote: RemoteAddr) -> Result<(), Error> {
-        dbg!(self.connection_state);
+        log::trace!("state: {:?}", self.connection_state);
         log::trace!("call_connect {:?}", remote);
         if self.connection_state == ConnectionState::Closed {
             self.remote_address = Some(remote);
-            self.connection_state = ConnectionState::SynSent;
+            self.set_state(ConnectionState::SynSent);
             self.tx_seq.init_seqn = random_seqnum();
             self.tx_seq.unack = self.tx_seq.init_seqn;
             self.tx_seq.next = self.tx_seq.init_seqn + 1;
@@ -373,10 +409,10 @@ impl Socket {
 
     /// Listen for connection
     pub fn call_listen(&mut self) -> Result<(), Error> {
-        dbg!(self.connection_state);
+        log::trace!("state: {:?}", self.connection_state);
         log::trace!("call_listen");
         if self.connection_state == ConnectionState::Closed {
-            self.connection_state = ConnectionState::Listen;
+            self.set_state(ConnectionState::Listen);
             Ok(())
         } else {
             Err(Error::InvalidStateTransition)
@@ -386,7 +422,7 @@ impl Socket {
     /// Send some data
     /// RFC 793 page 55
     pub fn call_send(&mut self, input_data: Vec<u8>) -> Result<(), Error> {
-        dbg!(self.connection_state);
+        log::trace!("state: {:?}", self.connection_state);
         log::trace!("call_send {:?}", input_data);
         match self.connection_state {
             ConnectionState::Listen => Err(Error::NotConnected),
@@ -446,7 +482,7 @@ impl Socket {
 
     /// Receive some data, if any available
     pub fn call_recv(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
-        dbg!(self.connection_state);
+        log::trace!("state: {:?}", self.connection_state);
         log::trace!("call_recv len={}", buffer.len());
         match self.connection_state {
             ConnectionState::Listen | ConnectionState::SynSent | ConnectionState::SynReceived => {
@@ -454,9 +490,7 @@ impl Socket {
             }
             ConnectionState::Established => {
                 if self.readable_buf_len() >= buffer.len() {
-                    dbg!(&self.buffers.readable, buffer.len());
                     let data = self.readable_buf_take(buffer.len());
-                    dbg!(&self.buffers.readable);
                     buffer.copy_from_slice(&data);
                     Ok(data.len())
                 } else {
@@ -490,7 +524,7 @@ impl Socket {
 
     /// Request closing the socket
     pub fn call_close(&mut self) -> Result<(), Error> {
-        dbg!(self.connection_state);
+        log::trace!("state: {:?}", self.connection_state);
         log::trace!("call_close");
         match self.connection_state {
             ConnectionState::Listen | ConnectionState::SynSent => {
@@ -508,10 +542,10 @@ impl Socket {
                     // Cannot close socket yet, as some items are queued
                     todo!("Queue sends");
                 } else {
-                    self.connection_state = ConnectionState::FinWait1;
+                    self.set_state(ConnectionState::FinWait1);
                     self.buffers.send_now.push_back(SegmentMeta {
                         seqn: self.tx_seq.next,
-                        ackn: 0,
+                        ackn: 0, // ??
                         window: self.rx_seq.window,
                         flags: SegmentFlags::FIN,
                         data: Vec::new(),
@@ -520,20 +554,21 @@ impl Socket {
                 }
             }
             ConnectionState::Established => {
-                let queued_sends = todo!("Queued sends");
-                if queued_sends {
-                    // Cannot close socket yet, as some items are queued
-                    todo!("Queue close until all sent");
+                // All sends must be segmentized first
+                if !self.buffers.tx.is_empty() {
+                    log::debug!("Delaying close until all sends are segmentized");
+                    return self.return_retry_after(WaitUntil::OutputBufferClear);
                 }
 
-                self.connection_state = ConnectionState::FinWait1;
+                self.set_state(ConnectionState::FinWait1);
                 self.buffers.send_now.push_back(SegmentMeta {
                     seqn: self.tx_seq.next,
-                    ackn: 0,
+                    ackn: self.rx_seq.next,
                     window: self.rx_seq.window,
                     flags: SegmentFlags::FIN,
                     data: Vec::new(),
                 });
+                self.tx_seq.next = self.tx_seq.next.wrapping_add(1); // FIN
                 Ok(())
             }
             ConnectionState::FinWait1
@@ -542,17 +577,21 @@ impl Socket {
             | ConnectionState::TimeWait
             | ConnectionState::LastAck => Err(Error::ConnectionClosing),
             ConnectionState::CloseWait => {
-                if todo!("any queued SENDs") {
-                    todo!("queue this close until all sent");
+                // All sends must be segmentized first
+                if !self.buffers.tx.is_empty() {
+                    log::debug!("Delaying close until all sends are segmentized");
+                    return self.return_retry_after(WaitUntil::OutputBufferClear);
                 }
-                self.connection_state = ConnectionState::LastAck;
+
+                self.set_state(ConnectionState::LastAck);
                 self.buffers.send_now.push_back(SegmentMeta {
                     seqn: self.tx_seq.next,
-                    ackn: 0,
+                    ackn: self.rx_seq.next,
                     window: self.rx_seq.window,
                     flags: SegmentFlags::FIN,
                     data: Vec::new(),
                 });
+                self.tx_seq.next = self.tx_seq.next.wrapping_add(1); // FIN
                 Ok(())
             }
             ConnectionState::Closed => Err(Error::NotConnected),
@@ -561,7 +600,7 @@ impl Socket {
 
     /// Request closing the socket
     pub fn call_abort(&mut self) -> Result<(), Error> {
-        dbg!(self.connection_state);
+        log::trace!("state: {:?}", self.connection_state);
         log::trace!("call_abort");
         match self.connection_state {
             ConnectionState::Listen | ConnectionState::SynSent => {
@@ -608,14 +647,19 @@ impl Socket {
     fn handle_received(&mut self, seg: SegmentMeta) -> Result<(), Error> {
         assert!(seg.seqn >= self.rx_seq.next); // TODO: wrapping
         log::trace!("handle_received");
+
+        // TODO: PSH flag handling
+
         let has_fin = seg.flags.contains(SegmentFlags::FIN);
+        let any_new_data = has_fin || !seg.data.is_empty();
 
         if seg.seqn == self.rx_seq.next {
             log::trace!("This packet is in-order");
             // Add seg to user-readable buffer
-            let len = seg.data.len();
-            self.buffers.readable.push_back(seg.data);
-            self.rx_seq.next = seg.seqn.wrapping_add(len as u32);
+            if !seg.data.is_empty() {
+                self.rx_seq.next = seg.seqn.wrapping_add(seg.data.len() as u32);
+                self.buffers.readable.push_back(seg.data);
+            }
 
             // Process out-of-order packets
             if !self.buffers.oo_rx.is_empty() {
@@ -631,19 +675,20 @@ impl Socket {
             self.rx_seq.window += len as u16;
         }
 
-        dbg!(self.tx_seq.next, self.rx_seq.next);
-
-        self.buffers.send_now.push_back(SegmentMeta {
-            seqn: self.tx_seq.next,
-            ackn: self.rx_seq.next,
-            window: self.rx_seq.window,
-            flags: SegmentFlags::ACK,
-            data: Vec::new(),
-        });
-
         if has_fin {
-            todo!("FIN bit processing");
-            self.connection_state = ConnectionState::CloseWait;
+            self.rx_seq.next = seg.seqn.wrapping_add(1);
+        }
+
+        // Do not ack ack-only packets
+        if any_new_data {
+            log::trace!("ACK'ing received packet");
+            self.buffers.send_now.push_back(SegmentMeta {
+                seqn: self.tx_seq.next,
+                ackn: self.rx_seq.next,
+                window: self.rx_seq.window,
+                flags: SegmentFlags::ACK,
+                data: Vec::new(),
+            });
         }
 
         Ok(())
@@ -652,7 +697,7 @@ impl Socket {
     /// Called on incoming segment
     /// See RFC 793 page 64
     pub fn on_segment(&mut self, seg: SegmentMeta) -> Result<(), Error> {
-        dbg!(self.connection_state);
+        log::trace!("state: {:?}", self.connection_state);
         log::trace!("on_segment {:?}", seg);
 
         if self.connection_state == ConnectionState::Closed {
@@ -687,7 +732,7 @@ impl Socket {
             let seqn = random_seqnum();
             self.tx_seq.next = seqn.wrapping_add(1);
             self.tx_seq.unack = seqn;
-            self.connection_state = ConnectionState::SynReceived;
+            self.set_state(ConnectionState::SynReceived);
             self.buffers.send_now.push_back(SegmentMeta {
                 seqn,
                 ackn: self.rx_seq.next,
@@ -734,7 +779,7 @@ impl Socket {
                 self.tx_seq.unack = seg.ackn;
                 if self.tx_seq.unack > self.tx_seq.init_seqn {
                     // Our SYN has been ACK'd
-                    self.connection_state = ConnectionState::Established;
+                    self.set_state(ConnectionState::Established);
                     // TODO: optimization: include queued data or controls here
                     self.buffers.send_now.push_back(SegmentMeta {
                         seqn: self.tx_seq.next,
@@ -745,7 +790,7 @@ impl Socket {
                     });
                 } else {
                     todo!("If packet has data, queue it until ESTABLISHED");
-                    self.connection_state = ConnectionState::SynReceived;
+                    self.set_state(ConnectionState::SynReceived);
                     self.buffers.send_now.push_back(SegmentMeta {
                         seqn: self.tx_seq.init_seqn,
                         ackn: self.rx_seq.next,
@@ -762,6 +807,7 @@ impl Socket {
         // Acceptability check (RFC 793 page 36 and 68)
         // TODO: process valid ACKs and RSTs even if receive_window == 0?
         if !self.check_segment_seq_ok(&seg) {
+            log::trace!("Non-acceptable segment {:#?}", seg);
             if !seg.flags.contains(SegmentFlags::RST) {
                 self.buffers.send_now.push_back(SegmentMeta {
                     seqn: self.tx_seq.next,
@@ -787,7 +833,7 @@ impl Socket {
                 ConnectionState::SynReceived => {
                     todo!("If actively connecting, error ConnectionRefused");
                     self.clear();
-                    self.connection_state = ConnectionState::Listen;
+                    self.set_state(ConnectionState::Listen);
                 }
                 ConnectionState::Established
                 | ConnectionState::FinWait1
@@ -822,122 +868,112 @@ impl Socket {
             todo!("Return error?");
         }
 
-        if !seg.flags.contains(SegmentFlags::ACK) {
-            return Ok(());
-        }
-
-        if self.connection_state == ConnectionState::LastAck {
-            todo!("Check for our FIN ack");
-            self.clear();
-            return Ok(());
-        }
-
-        if self.connection_state == ConnectionState::TimeWait {
-            todo!("Is this FIN?");
-            todo!("Ack FIN");
-            todo!("Restart MSL 2 timeout");
-            return Ok(());
-        }
-
-        if self.connection_state == ConnectionState::SynReceived {
-            // TODO: wrapping
-            if self.tx_seq.unack <= seg.ackn && seg.ackn <= self.tx_seq.next {
-                self.connection_state = ConnectionState::Established;
-            }
-            // TODO: should we return here?
-            dbg!("cont ConnectionState::SynReceived");
-        }
-
-        if seg.ackn < self.tx_seq.unack || seg.ackn > self.tx_seq.next {
-            log::warn!("Dropping invalid ACK");
-            return Ok(());
-        }
-
-        if seg.ackn == self.tx_seq.unack {
-            // Duplicate ACK for the current segment
-            dbg!("Duplicate");
-            // self.dup_ack_count += 1;
-            // log::trace!("new duplicate, count={}", self.dup_ack_count);
-            // if self.dup_ack_count > 2 {
-            //     // Fast recovery
-            //     todo!("Fast recovery");
-            // } else if self.dup_ack_count == 2 {
-            //     // Fast retransmit
-            //     todo!("Fast retransmit");
-            // }
-        } else {
-            // New valid ACK
-            debug_assert!(self.tx_seq.unack < seg.ackn && seg.ackn <= self.tx_seq.next);
-
-            // Window update subroutine
-            if self.dup_ack_count > 0 {
-                self.congestation_window = SLOW_START_TRESHOLD;
-            } else if self.congestation_window <= SLOW_START_TRESHOLD {
-                self.congestation_window *= 2;
-            } else {
-                // TODO: cast better
-                self.congestation_window += seg.data.len() as u16;
-            }
-
-            // End of window update
-            self.tx_seq.window = seg.window.min(self.congestation_window);
-
-            self.clear_re_tx_range(self.tx_seq.unack, seg.ackn);
-            self.tx_seq.unack = seg.ackn;
-            self.exp_backoff = 1;
-            self.timers.re_tx = None;
-
-            self.trigger(|waitfor| {
-                if let WaitFor::SendAck { seqn } = waitfor {
-                    seqn <= seg.ackn
+        if seg.flags.contains(SegmentFlags::ACK) {
+            if self.connection_state == ConnectionState::LastAck {
+                if seg.ackn == self.tx_seq.next {
+                    log::trace!("Last ACK received");
+                    self.clear();
                 } else {
-                    false
+                    log::trace!("Last ACK not received ??");
                 }
-            });
-        }
+                return Ok(());
+            }
 
-        if self.connection_state == ConnectionState::FinWait1 {
-            todo!("Has our FIN been ack'd?");
-            self.connection_state = ConnectionState::FinWait2;
-        }
+            if self.connection_state == ConnectionState::TimeWait {
+                todo!("Is this FIN?");
+                todo!("Ack FIN");
+                todo!("Restart MSL 2 timeout");
+                return Ok(());
+            }
 
-        if self.connection_state == ConnectionState::FinWait2 {
-            todo!("If user has pending CLOSE call, that can return now");
-        }
+            if self.connection_state == ConnectionState::SynReceived {
+                // TODO: wrapping
+                if self.tx_seq.unack <= seg.ackn && seg.ackn <= self.tx_seq.next {
+                    self.set_state(ConnectionState::Established);
+                }
+                // TODO: should we return here?
+                dbg!("cont ConnectionState::SynReceived");
+            }
 
-        if self.connection_state == ConnectionState::Closing {
-            if todo!("Has our FIN been ack'd?") {
-                self.connection_state = ConnectionState::TimeWait;
+            if seg.ackn < self.tx_seq.unack || seg.ackn > self.tx_seq.next {
+                log::warn!("Dropping invalid ACK");
+                return Ok(());
+            }
+
+            if seg.ackn == self.tx_seq.unack {
+                // Duplicate ACK for the current segment
+                dbg!("Duplicate");
+                // self.dup_ack_count += 1;
+                // log::trace!("new duplicate, count={}", self.dup_ack_count);
+                // if self.dup_ack_count > 2 {
+                //     // Fast recovery
+                //     todo!("Fast recovery");
+                // } else if self.dup_ack_count == 2 {
+                //     // Fast retransmit
+                //     todo!("Fast retransmit");
+                // }
+            } else {
+                // New valid ACK
+                debug_assert!(self.tx_seq.unack < seg.ackn && seg.ackn <= self.tx_seq.next);
+
+                // Window update subroutine
+                if self.dup_ack_count > 0 {
+                    self.congestation_window = SLOW_START_TRESHOLD;
+                } else if self.congestation_window <= SLOW_START_TRESHOLD {
+                    self.congestation_window *= 2;
+                } else {
+                    // TODO: cast better
+                    self.congestation_window += seg.data.len() as u16;
+                }
+
+                // End of window update
+                self.tx_seq.window = seg.window.min(self.congestation_window);
+
+                self.clear_re_tx_range(self.tx_seq.unack, seg.ackn);
+                self.tx_seq.unack = seg.ackn;
+                self.exp_backoff = 1;
+                self.timers.re_tx = None;
+
+                self.trigger(|until| {
+                    if let WaitUntil::SendAck { seqn } = until {
+                        seqn <= seg.ackn
+                    } else {
+                        false
+                    }
+                });
+
+                if self.connection_state == ConnectionState::FinWait1 {
+                    if seg.ackn == self.tx_seq.next {
+                        // TODO: cleanup&document condition
+                        assert!(seg.ackn == self.tx_seq.unack, "???");
+                        log::trace!("Out FIN has been ACK'd");
+                        self.set_state(ConnectionState::FinWait2);
+                    }
+                }
+
+                if self.connection_state == ConnectionState::FinWait2 {
+                    self.trigger(|w| w == WaitUntil::OutputBufferClear);
+                }
+
+                if self.connection_state == ConnectionState::Closing {
+                    if todo!("Has our FIN been ack'd?") {
+                        self.set_state(ConnectionState::TimeWait);
+                    }
+                }
             }
         }
-
-        let has_fin = seg.flags.contains(SegmentFlags::FIN);
 
         // Process segment data, if any
-        if !seg.data.is_empty() {
-            match self.connection_state {
-                ConnectionState::Established
-                | ConnectionState::FinWait1
-                | ConnectionState::FinWait2 => {
-                    // TODO: PSH flag handling
-
-                    let len = seg.data.len() as u32;
-                    self.handle_received(seg);
-                    // TODO: adjust self.rx_seq.window
-                    //       The total of RCV.NXT and RCV.WND should not be reduced.
-
-                    // TODO: optimization: piggyback the ack into some data if possible
-                    log::trace!("ACK'ing incoming data");
-                    self.buffers.send_now.push_back(SegmentMeta {
-                        seqn: self.tx_seq.next,
-                        ackn: self.rx_seq.next,
-                        window: self.rx_seq.window,
-                        flags: SegmentFlags::ACK,
-                        data: Vec::new(),
-                    })
-                }
-                other => {
-                    log::warn!("Peer error: sends data after FIN");
+        match self.connection_state {
+            ConnectionState::Established
+            | ConnectionState::FinWait1
+            | ConnectionState::FinWait2 => {
+                // TODO: window size adjustment
+                self.handle_received(seg.clone());
+            }
+            other => {
+                if seg.flags.contains(SegmentFlags::FIN) || !seg.data.is_empty() {
+                    log::warn!("Peer error: sends data or FIN after FIN");
                 }
             }
         }
@@ -949,29 +985,36 @@ impl Socket {
             return Ok(());
         }
 
-        if has_fin {
-            todo!("Singal user: ConnectionClosing");
-            todo!("Singal pending recvs: ConnectionClosing");
+        if seg.flags.contains(SegmentFlags::FIN) {
+            log::trace!("Got FIN packet");
 
-            todo!("FIN bit processing");
+            // TODO: Signal user: ConnectionClosing
+
+            // Retry all recvs, which will not return ConnectionClosing after the buffer is empty
+            self.trigger(|until| matches!(until, WaitUntil::Recv { .. }));
+
+            self.rx_seq.next = seg.seqn.wrapping_add(1); // Make space for ACK
 
             match self.connection_state {
                 ConnectionState::SynReceived | ConnectionState::Established => {
-                    self.connection_state = ConnectionState::CloseWait;
+                    log::trace!("XXX: 1");
+                    self.set_state(ConnectionState::CloseWait);
                 }
                 ConnectionState::FinWait1 => {
-                    if todo!("Has our FIN been ACK'd (this segment or otherwise?)") {
-                        self.connection_state = ConnectionState::TimeWait;
-                        todo!("Turn off timers");
-                        todo!("Time-wait timer setup");
+                    dbg!("fw1 ck", self.tx_seq.unack, self.tx_seq.next);
+                    if self.tx_seq.unack == self.tx_seq.next {
+                        // Our FIN has been ACK'd
+                        self.set_state(ConnectionState::TimeWait);
+                        self.timers.clear();
+                        self.timers.timewait = Some(Instant::now().add(MAX_SEGMENT_LIFETIME * 2));
                     } else {
-                        self.connection_state = ConnectionState::Closing;
+                        self.set_state(ConnectionState::Closing);
                     }
                 }
                 ConnectionState::FinWait2 => {
-                    self.connection_state = ConnectionState::TimeWait;
-                    todo!("Turn off timers");
-                    todo!("Time-wait timer setup");
+                    self.set_state(ConnectionState::TimeWait);
+                    self.timers.clear();
+                    self.timers.timewait = Some(Instant::now().add(MAX_SEGMENT_LIFETIME * 2));
                 }
                 ConnectionState::TimeWait => {
                     todo!("Restart 2MSL time-wait timeout");
@@ -983,11 +1026,58 @@ impl Socket {
         Ok(())
     }
 
-    /// Called on timeout segment
-    pub fn on_timeout(&mut self) -> Result<(), Error> {
-        dbg!(self.connection_state);
+    fn on_timer_re_tx(&mut self) {
+        log::trace!("on_timer_re_tx");
+        match self.connection_state {
+            ConnectionState::Listen
+            | ConnectionState::SynSent
+            | ConnectionState::SynReceived
+            | ConnectionState::Established
+            | ConnectionState::FinWait1
+            | ConnectionState::Closing
+            | ConnectionState::CloseWait
+            | ConnectionState::LastAck => {
+                todo!("CALC RTO");
+                todo!("REARM TIMER");
+                todo!("SEND FROM RE_TX QUEUE");
+            }
+            ConnectionState::FinWait2 | ConnectionState::TimeWait | ConnectionState::Closed => {
+                unreachable!()
+            }
+        }
+    }
+
+    fn on_timer_timewait(&mut self) {
+        log::trace!("on_timer_timewait");
+        assert!(self.connection_state == ConnectionState::TimeWait);
+        self.clear();
+    }
+
+    fn on_timer_usertime(&mut self) {
+        log::trace!("on_timer_usertime");
+        todo!("Signal error to all outstanding calls");
+        self.clear();
+    }
+
+    /// To be called whenever a timer expires, or simply periodically
+    pub fn on_time_tick(&mut self, time: Instant) {
+        log::trace!("state: {:?}", self.connection_state);
         log::trace!("on_timeout");
-        todo!();
+
+        if self.timers.re_tx.map_or(false, |t| t <= time) {
+            self.timers.re_tx = None;
+            self.on_timer_re_tx();
+        }
+
+        if self.timers.timewait.map_or(false, |t| t <= time) {
+            self.timers.timewait = None;
+            self.on_timer_timewait();
+        }
+
+        if self.timers.usertime.map_or(false, |t| t <= time) {
+            self.timers.usertime = None;
+            self.on_timer_usertime();
+        }
     }
 }
 
