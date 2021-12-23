@@ -4,6 +4,11 @@
 #![feature(default_free_fn, duration_constants, let_else, drain_filter)]
 #![allow(dead_code, unreachable_code, unused)]
 
+//! TODO: Return Error vs Signal User
+//! TODO: Window scaling
+//! TODO: Wrapping comparisons with windows
+//! TODO: std-compat
+
 #[macro_use]
 extern crate alloc;
 
@@ -12,6 +17,7 @@ use core::time::Duration;
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use hashbrown::HashSet;
 
 mod event;
 mod result;
@@ -31,10 +37,6 @@ mod log {
     pub use std::println as debug;
     pub use std::println as trace;
 }
-
-// TODO: Return Error vs Signal User
-// TODO: Window scaling
-// TODO: Wrapping comparisons with windows?
 
 ///// MOCKS //////////////////////////////
 
@@ -242,7 +244,10 @@ pub struct Socket {
     buffers: Buffers,
     timings: Timings,
     timers: Timers,
-    pending: Vec<(WaitUntil, Cookie)>,
+    /// Suspended user queries waiting for condition
+    events_suspended: HashSet<(WaitUntil, Cookie)>,
+    /// Suspended user queries ready for continuing
+    events_ready: HashSet<Cookie>,
     next_cookie: Cookie,
     pub options: SocketOptions,
 }
@@ -261,7 +266,8 @@ impl Socket {
             buffers: Buffers::default(),
             timings: Timings::default(),
             timers: Timers::default(),
-            pending: Vec::new(),
+            events_suspended: HashSet::new(),
+            events_ready: HashSet::new(),
             next_cookie: Cookie::ZERO,
             options: SocketOptions::default(),
         }
@@ -272,9 +278,16 @@ impl Socket {
     }
 
     /// All state accesses are done using this so they can be logged
+    /// and relevant events triggered
     fn set_state(&mut self, state: ConnectionState) {
         log::trace!("State {:?} => {:?}", self.connection_state, state);
         self.connection_state = state;
+        match self.connection_state {
+            ConnectionState::Established => {
+                self.trigger(|w| w == WaitUntil::Established);
+            }
+            _ => {}
+        }
     }
 
     fn clear(&mut self) {
@@ -287,23 +300,51 @@ impl Socket {
     }
 
     fn new_cookie(&mut self) -> Cookie {
-        let result = self.next_cookie;
+        // let result = self.next_cookie;
+        // self.next_cookie = self.next_cookie.next();
+        // result
         self.next_cookie = self.next_cookie.next();
-        result
+        self.next_cookie
     }
 
     fn return_retry_after<T>(&mut self, until: WaitUntil) -> Result<T, Error> {
         let cookie = self.new_cookie();
-        self.pending.push((until, cookie));
+        log::trace!("Suspend/retry {:?} {:?}", until, cookie);
+        self.events_suspended.insert((until, cookie));
         Err(Error::RetryAfter(cookie))
+    }
+
+    fn return_continue_after<T>(&mut self, until: WaitUntil) -> Result<T, Error> {
+        let cookie = self.new_cookie();
+        log::trace!("Suspend/continue {:?} {:?}", until, cookie);
+        self.events_suspended.insert((until, cookie));
+        Err(Error::ContinueAfter(cookie))
     }
 
     fn trigger<F>(&mut self, f: F)
     where
         F: Fn(WaitUntil) -> bool,
     {
-        for (_, cookie) in self.pending.drain_filter(|(wait, _)| f(*wait)) {
-            todo!("Trigger cookie {:?}", cookie);
+        for (_, cookie) in self.events_suspended.drain_filter(|(wait, _)| f(*wait)) {
+            log::trace!("Triggered cookie {:?}", cookie);
+            self.events_ready.insert(cookie);
+        }
+    }
+
+    /// Clear event if it is active.
+    /// Returns `Ok(())` if the event was active, an `Err(())` otherwise.
+    #[must_use]
+    pub fn try_wait_event(&mut self, cookie: Cookie) -> Result<(), ()> {
+        if self.events_ready.remove(&cookie) {
+            log::trace!("Clearing cookie {:?}", cookie);
+            Ok(())
+        } else {
+            debug_assert!(
+                self.events_suspended.iter().any(|(_, c)| *c == cookie),
+                "Requested cookie is not present in either list"
+            );
+            log::trace!("Cookie {:?} was not ready", cookie);
+            Err(())
         }
     }
 
@@ -325,6 +366,19 @@ impl Socket {
 
     /// Remove ACK'd segments from re_tx queue
     fn clear_re_tx_range(&mut self, start: u32, end: u32) {
+        log::trace!("Clearing range {}..={} from re_tx buffer", start, end);
+
+        // Trigger events
+        self.trigger(|w| {
+            if let WaitUntil::Acknowledged { seqn } = w {
+                // TODO: wrapping
+                start <= seqn && seqn <= end
+            } else {
+                false
+            }
+        });
+
+        // Clear queue
         loop {
             let Some(head) = self.buffers.re_tx.get(0) else {
                 return;
@@ -427,7 +481,11 @@ impl Socket {
         match self.connection_state {
             ConnectionState::Listen => Err(Error::NotConnected),
             ConnectionState::SynSent | ConnectionState::SynReceived => {
-                todo!("queue until ESTABLISHED");
+                let len = input_data.len() as u32;
+                self.buffers.tx.push_back(input_data);
+                return self.return_continue_after(WaitUntil::Acknowledged {
+                    seqn: self.tx_seq.next.wrapping_add(len),
+                });
             }
             ConnectionState::Established | ConnectionState::CloseWait => {
                 self.buffers.tx.push_back(input_data);
@@ -445,22 +503,7 @@ impl Socket {
                     if self.tx_buf_len() >= MAX_SEGMENT_SIZE
                         || (self.tx_buf_len() > 0 && self.options.nagle_delay == Duration::ZERO)
                     {
-                        let data_to_send = self.tx_buf_take(MAX_SEGMENT_SIZE);
-                        let len = data_to_send.len();
-                        log::trace!("Sending packet with data {:?}", data_to_send);
-                        let seg = SegmentMeta {
-                            seqn: self.tx_seq.next,
-                            ackn: self.rx_seq.next,
-                            window: self.rx_seq.window,
-                            flags: SegmentFlags::ACK,
-                            data: data_to_send,
-                        };
-                        self.buffers.re_tx.push_back(seg.clone());
-                        // Piggybacked ACK in established
-                        // https://en.wikipedia.org/wiki/Piggybacking_(data_transmission)
-                        self.buffers.send_now.push_back(seg);
-                        self.timers.re_tx = Some(Instant::now().add(self.timings.rto));
-                        self.tx_seq.next = self.tx_seq.next.wrapping_add(len as u32); // XXX: is this before or after creating seg?
+                        self.send_ack();
                         return Ok(());
                     }
                 }
@@ -486,7 +529,7 @@ impl Socket {
         log::trace!("call_recv len={}", buffer.len());
         match self.connection_state {
             ConnectionState::Listen | ConnectionState::SynSent | ConnectionState::SynReceived => {
-                todo!("queue until ESTABLISHED");
+                return self.return_retry_after(WaitUntil::Established);
             }
             ConnectionState::Established => {
                 if self.readable_buf_len() >= buffer.len() {
@@ -642,6 +685,30 @@ impl Socket {
         }
     }
 
+    /// Sends an ack packet, including any data form buffer if possible
+    fn send_ack(&mut self) {
+        // TODO: check window size before sending any payload
+
+        let data_to_send = self.tx_buf_take(MAX_SEGMENT_SIZE);
+        let len = data_to_send.len();
+        log::trace!("Sending ACK with data {:?}", data_to_send);
+        let seg = SegmentMeta {
+            seqn: self.tx_seq.next,
+            ackn: self.rx_seq.next,
+            window: self.rx_seq.window,
+            flags: SegmentFlags::ACK,
+            data: data_to_send,
+        };
+        self.buffers.re_tx.push_back(seg.clone());
+        self.buffers.send_now.push_back(seg);
+
+        self.tx_seq.next = self.tx_seq.next.wrapping_add(len as u32); // XXX: is this before or after creating seg?
+
+        if len != 0 {
+            self.timers.re_tx = Some(Instant::now().add(self.timings.rto));
+        }
+    }
+
     /// Handles packets valid ACKs (including those with duplicates)
     /// Section ES3 in the PDF
     fn handle_received(&mut self, seg: SegmentMeta) -> Result<(), Error> {
@@ -682,13 +749,7 @@ impl Socket {
         // Do not ack ack-only packets
         if any_new_data {
             log::trace!("ACK'ing received packet");
-            self.buffers.send_now.push_back(SegmentMeta {
-                seqn: self.tx_seq.next,
-                ackn: self.rx_seq.next,
-                window: self.rx_seq.window,
-                flags: SegmentFlags::ACK,
-                data: Vec::new(),
-            });
+            self.send_ack();
         }
 
         Ok(())
@@ -780,14 +841,7 @@ impl Socket {
                 if self.tx_seq.unack > self.tx_seq.init_seqn {
                     // Our SYN has been ACK'd
                     self.set_state(ConnectionState::Established);
-                    // TODO: optimization: include queued data or controls here
-                    self.buffers.send_now.push_back(SegmentMeta {
-                        seqn: self.tx_seq.next,
-                        ackn: self.rx_seq.next,
-                        window: self.rx_seq.window,
-                        flags: SegmentFlags::ACK,
-                        data: Vec::new(),
-                    });
+                    self.send_ack();
                 } else {
                     todo!("If packet has data, queue it until ESTABLISHED");
                     self.set_state(ConnectionState::SynReceived);
@@ -935,12 +989,23 @@ impl Socket {
                 self.timers.re_tx = None;
 
                 self.trigger(|until| {
-                    if let WaitUntil::SendAck { seqn } = until {
+                    if let WaitUntil::Acknowledged { seqn } = until {
                         seqn <= seg.ackn
                     } else {
                         false
                     }
                 });
+
+                if self.connection_state == ConnectionState::Closing {
+                    if seg.ackn == self.tx_seq.next {
+                        assert!(seg.ackn == self.tx_seq.unack, "???");
+                        // TODO: cleanup&document condition
+                        log::trace!("Out FIN has been ACK'd");
+                        self.set_state(ConnectionState::TimeWait);
+                        self.timers.clear();
+                        self.timers.timewait = Some(Instant::now().add(MAX_SEGMENT_LIFETIME * 2));
+                    }
+                }
 
                 if self.connection_state == ConnectionState::FinWait1 {
                     if seg.ackn == self.tx_seq.next {
@@ -953,12 +1018,6 @@ impl Socket {
 
                 if self.connection_state == ConnectionState::FinWait2 {
                     self.trigger(|w| w == WaitUntil::OutputBufferClear);
-                }
-
-                if self.connection_state == ConnectionState::Closing {
-                    if todo!("Has our FIN been ack'd?") {
-                        self.set_state(ConnectionState::TimeWait);
-                    }
                 }
             }
         }

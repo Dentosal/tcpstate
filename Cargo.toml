@@ -10,6 +10,7 @@ std = []
 [dependencies]
 bitflags = "1.2"
 log = "0.4"
+hashbrown = "0.11"
 
 [dev-dependencies]
 # Tests
