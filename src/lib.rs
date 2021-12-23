@@ -439,6 +439,11 @@ impl Socket {
         }
     }
 
+    /// Amount of data available for receiving without blocking
+    pub fn recv_available(&mut self) -> usize {
+        self.readable_buf_len()
+    }
+
     /// Receive some data, if any available
     pub fn call_recv(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
         dbg!(self.connection_state);
@@ -449,7 +454,9 @@ impl Socket {
             }
             ConnectionState::Established => {
                 if self.readable_buf_len() >= buffer.len() {
+                    dbg!(&self.buffers.readable, buffer.len());
                     let data = self.readable_buf_take(buffer.len());
+                    dbg!(&self.buffers.readable);
                     buffer.copy_from_slice(&data);
                     Ok(data.len())
                 } else {
@@ -847,16 +854,17 @@ impl Socket {
         }
 
         if seg.ackn == self.tx_seq.unack {
-            // Duplicate ACK for an old segment
-            self.dup_ack_count += 1;
-            log::trace!("new duplicate, count={}", self.dup_ack_count);
-            if self.dup_ack_count > 2 {
-                // Fast recovery
-                todo!("Fast recovery");
-            } else if self.dup_ack_count == 2 {
-                // Fast retransmit
-                todo!("Fast retransmit");
-            }
+            // Duplicate ACK for the current segment
+            dbg!("Duplicate");
+            // self.dup_ack_count += 1;
+            // log::trace!("new duplicate, count={}", self.dup_ack_count);
+            // if self.dup_ack_count > 2 {
+            //     // Fast recovery
+            //     todo!("Fast recovery");
+            // } else if self.dup_ack_count == 2 {
+            //     // Fast retransmit
+            //     todo!("Fast retransmit");
+            // }
         } else {
             // New valid ACK
             debug_assert!(self.tx_seq.unack < seg.ackn && seg.ackn <= self.tx_seq.next);
@@ -915,7 +923,6 @@ impl Socket {
 
                     let len = seg.data.len() as u32;
                     self.handle_received(seg);
-                    // self.rx_seq.next = self.rx_seq.next.wrapping_add(len);
                     // TODO: adjust self.rx_seq.window
                     //       The total of RCV.NXT and RCV.WND should not be reduced.
 
