@@ -18,8 +18,8 @@ extern crate alloc;
 
 use core::time::Duration;
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use hashbrown::HashSet;
 
 pub mod mock;
 pub mod options;
@@ -36,7 +36,7 @@ mod tx;
 
 use crate::mock::*;
 
-use event::WaitUntil;
+use event::{Events, WaitUntil};
 use options::*;
 use rx::*;
 use timers::*;
@@ -76,7 +76,6 @@ pub fn response_to_closed(seg: SegmentMeta) -> SegmentMeta {
 #[derive(Debug, Clone)]
 pub struct Socket {
     connection_state: ConnectionState,
-    remote_address: Option<RemoteAddr>,
     dup_ack_count: u8,
     congestation_window: u16,
     exp_backoff: u16,
@@ -84,11 +83,7 @@ pub struct Socket {
     rx: RxBuffer,
     timings: Timings,
     timers: Timers,
-    /// Suspended user queries waiting for condition
-    events_suspended: HashSet<(WaitUntil, Cookie)>,
-    /// Suspended user queries ready for continuing
-    events_ready: HashSet<Cookie>,
-    next_cookie: Cookie,
+    events: Events<WaitUntil>,
     pub options: SocketOptions,
 }
 
@@ -97,7 +92,6 @@ impl Socket {
     pub fn new() -> Self {
         Self {
             connection_state: ConnectionState::Closed,
-            remote_address: None,
             dup_ack_count: 0,
             congestation_window: INITIAL_WINDOW_SIZE,
             exp_backoff: 1,
@@ -105,9 +99,7 @@ impl Socket {
             tx: TxBuffer::default(),
             timings: Timings::default(),
             timers: Timers::default(),
-            events_suspended: HashSet::new(),
-            events_ready: HashSet::new(),
-            next_cookie: Cookie::ZERO,
+            events: Events::new(),
             options: SocketOptions::default(),
         }
     }
@@ -142,14 +134,15 @@ impl Socket {
 
         // Triggers
         if self.connection_state.output_buffer_guaranteed_clear() {
-            self.trigger(|w| w == WaitUntil::OutputBufferClear);
+            self.events
+                .trigger(|w| w == WaitUntil::OutputBufferClear, Ok(()));
         }
 
         match self.connection_state {
             ConnectionState::Established {
                 tx_state, rx_state, ..
             } => {
-                self.trigger(|w| w == WaitUntil::Established);
+                self.events.trigger(|w| w == WaitUntil::Established, Ok(()));
             }
             _ => {}
         }
@@ -164,11 +157,11 @@ impl Socket {
         *self = Self::new();
     }
 
-    fn reset(&mut self, error: Error) {
+    fn reset(&mut self) {
         log::trace!(
-            "Error: State {:?} => {:?}",
+            "Reset: State {:?} => {:?}",
             self.connection_state,
-            ConnectionState::Closed
+            ConnectionState::Reset
         );
         *self = Self::new();
         self.connection_state = ConnectionState::Reset;
@@ -193,14 +186,17 @@ impl Socket {
         log::trace!("Clearing range {}..={} from re_tx buffer", start, end);
 
         // Trigger events
-        self.trigger(|w| {
-            if let WaitUntil::Acknowledged { seqn } = w {
-                // TODO: wrapping
-                start <= seqn && seqn <= end
-            } else {
-                false
-            }
-        });
+        self.events.trigger(
+            |w| {
+                if let WaitUntil::Acknowledged { seqn } = w {
+                    // TODO: wrapping
+                    start <= seqn && seqn <= end
+                } else {
+                    false
+                }
+            },
+            Ok(()),
+        );
 
         // Clear queue
         loop {
@@ -218,6 +214,12 @@ impl Socket {
         }
     }
 
+    /// Clear event if it is active.
+    /// Returns `Ok(())` if the event was active, an `Err(())` otherwise.
+    pub fn try_wait_event(&mut self, cookie: Cookie) -> Result<(), Error> {
+        self.events.try_wait(cookie)
+    }
+
     pub fn take_outbound(&mut self) -> Option<SegmentMeta> {
         self.tx.send_now.pop_front()
     }
@@ -226,12 +228,11 @@ impl Socket {
     pub fn call_connect(&mut self, remote: RemoteAddr) -> Result<(), Error> {
         log::trace!("state: {:?}", self.connection_state);
         log::trace!("call_connect {:?}", remote);
-        debug_assert!(self.events_ready.is_empty());
+        debug_assert!(self.events.ready.is_empty());
         if matches!(
             self.connection_state,
             ConnectionState::Closed | ConnectionState::Reset
         ) {
-            self.remote_address = Some(remote);
             self.set_state(ConnectionState::SynSent);
             self.tx.init();
             self.tx.send_now.push_back(SegmentMeta {
@@ -241,23 +242,7 @@ impl Socket {
                 flags: SegmentFlags::SYN,
                 data: Vec::new(),
             });
-            Ok(())
-        } else {
-            Err(Error::InvalidStateTransition)
-        }
-    }
-
-    /// Listen for connection
-    pub fn call_listen(&mut self) -> Result<(), Error> {
-        log::trace!("call_listen");
-        log::trace!("state: {:?}", self.connection_state);
-        debug_assert!(self.events_ready.is_empty());
-        if matches!(
-            self.connection_state,
-            ConnectionState::Closed | ConnectionState::Reset
-        ) {
-            self.set_state(ConnectionState::Listen);
-            Ok(())
+            self.events.return_continue_after(WaitUntil::Established)
         } else {
             Err(Error::InvalidStateTransition)
         }
@@ -269,7 +254,7 @@ impl Socket {
         log::trace!("call_send {:?}", input_data);
         log::trace!("state: {:?}", self.connection_state);
         assert!(!input_data.is_empty());
-        debug_assert!(self.events_ready.is_empty());
+        debug_assert!(self.events.ready.is_empty());
         match self.connection_state {
             ConnectionState::Reset => Err(Error::ConnectionReset),
             ConnectionState::Closed | ConnectionState::Listen => Err(Error::NotConnected),
@@ -277,7 +262,7 @@ impl Socket {
             ConnectionState::SynSent | ConnectionState::SynReceived => {
                 let len = input_data.len() as u32;
                 self.tx.tx.write_bytes(input_data);
-                return self.return_continue_after(WaitUntil::Acknowledged {
+                return self.events.return_continue_after(WaitUntil::Acknowledged {
                     seqn: self.tx.next.wrapping_add(len),
                 });
             }
@@ -308,14 +293,14 @@ impl Socket {
     pub fn call_recv(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
         log::trace!("call_recv len={}", buffer.len());
         log::trace!("state: {:?}", self.connection_state);
-        debug_assert!(self.events_ready.is_empty());
+        debug_assert!(self.events.ready.is_empty());
         match self.connection_state {
             ConnectionState::Reset => Err(Error::ConnectionReset),
             ConnectionState::Closed => Err(Error::NotConnected),
             ConnectionState::TimeWait => Err(Error::ConnectionClosing),
             ConnectionState::Listen | ConnectionState::SynSent | ConnectionState::SynReceived => {
                 log::debug!("Suspending read request until the connection is established");
-                self.return_retry_after(WaitUntil::Established)
+                self.events.return_retry_after(WaitUntil::Established)
             }
             ConnectionState::Established {
                 tx_state,
@@ -335,7 +320,7 @@ impl Socket {
                         Ok(data.len())
                     } else {
                         log::debug!("Suspending read request until enough data is available");
-                        self.return_retry_after(WaitUntil::Recv {
+                        self.events.return_retry_after(WaitUntil::Recv {
                             count: buffer.len() as u32,
                         })
                     }
@@ -406,7 +391,7 @@ impl Socket {
     pub fn call_shutdown(&mut self) -> Result<(), Error> {
         log::trace!("call_shutdown");
         log::trace!("state: {:?}", self.connection_state);
-        debug_assert!(self.events_ready.is_empty());
+        debug_assert!(self.events.ready.is_empty());
         match self.connection_state {
             ConnectionState::Reset => Err(Error::ConnectionReset),
             ConnectionState::Closed => Err(Error::NotConnected),
@@ -437,7 +422,7 @@ impl Socket {
     pub fn call_close(&mut self) -> Result<(), Error> {
         log::trace!("call_close");
         log::trace!("state: {:?}", self.connection_state);
-        debug_assert!(self.events_ready.is_empty());
+        debug_assert!(self.events.ready.is_empty());
         match self.connection_state {
             ConnectionState::Reset => Err(Error::ConnectionReset),
             ConnectionState::Closed => Err(Error::NotConnected),
@@ -476,7 +461,7 @@ impl Socket {
     pub fn call_abort(&mut self) -> Result<(), Error> {
         log::trace!("call_abort");
         log::trace!("state: {:?}", self.connection_state);
-        debug_assert!(self.events_ready.is_empty());
+        debug_assert!(self.events.ready.is_empty());
         match self.connection_state {
             ConnectionState::Reset => Err(Error::ConnectionReset),
             ConnectionState::Closed => Err(Error::NotConnected),
@@ -520,7 +505,8 @@ impl Socket {
 
         let (tx_data, tx_fin) = self.tx.tx.read_bytes(MAX_SEGMENT_SIZE);
         if tx_data.len() == 0 {
-            self.trigger(|w| w == WaitUntil::OutputBufferClear);
+            self.events
+                .trigger(|w| w == WaitUntil::OutputBufferClear, Ok(()));
         }
 
         let len = tx_data.len();
@@ -551,8 +537,8 @@ impl Socket {
     /// Called on incoming segment
     /// See RFC 793 page 64
     pub fn on_segment(&mut self, seg: SegmentMeta) {
-        log::trace!("state: {:?}", self.connection_state);
         log::trace!("on_segment {:?}", seg);
+        log::trace!("state: {:?}", self.connection_state);
 
         match self.connection_state {
             ConnectionState::Closed | ConnectionState::Reset => {
@@ -597,12 +583,10 @@ impl Socket {
             }
 
             ConnectionState::SynSent => {
-                let ack_acceptable = if seg.flags.contains(SegmentFlags::ACK) {
-                    if seg.flags.contains(SegmentFlags::RST) {
-                        return;
-                    }
-
-                    if seg.ackn <= self.tx.init_seqn || seg.ackn > self.tx.next {
+                if seg.flags.contains(SegmentFlags::ACK) {
+                    if (seg.ackn <= self.tx.init_seqn || seg.ackn > self.tx.next)
+                        && !(seg.ackn <= self.tx.unack && seg.ackn <= self.tx.next)
+                    {
                         self.tx.send_now.push_back(SegmentMeta {
                             seqn: seg.ackn,
                             ackn: 0,
@@ -612,17 +596,10 @@ impl Socket {
                         });
                         return;
                     }
-
-                    seg.ackn <= self.tx.unack || seg.ackn <= self.tx.next
-                } else {
-                    false
-                };
+                }
 
                 if seg.flags.contains(SegmentFlags::RST) {
-                    if ack_acceptable {
-                        self.clear();
-                        self.reset(Error::ConnectionReset);
-                    }
+                    self.reset();
                     return;
                 }
 
@@ -649,6 +626,7 @@ impl Socket {
             }
             ConnectionState::TimeWait => {
                 if !self.check_segment_seq_ok(&seg) {
+                    log::trace!("RST!!");
                     if !seg.flags.contains(SegmentFlags::RST) {
                         self.tx.send_now.push_back(SegmentMeta {
                             seqn: self.tx.next,
@@ -775,26 +753,32 @@ impl Socket {
 
                         // Signal that data is readable for any calls waiting for that
                         let available = self.rx.available_bytes();
-                        self.trigger(|w| {
-                            if let WaitUntil::Recv { count } = w {
-                                (count as usize) <= available
-                            } else {
-                                false
-                            }
-                        });
+                        self.events.trigger(
+                            |w| {
+                                if let WaitUntil::Recv { count } = w {
+                                    (count as usize) <= available
+                                } else {
+                                    false
+                                }
+                            },
+                            Ok(()),
+                        );
 
                         self.clear_re_tx_range(self.tx.unack, seg.ackn);
                         self.tx.unack = seg.ackn;
                         self.exp_backoff = 1;
                         self.timers.re_tx = None;
 
-                        self.trigger(|until| {
-                            if let WaitUntil::Acknowledged { seqn } = until {
-                                seqn <= seg.ackn
-                            } else {
-                                false
-                            }
-                        });
+                        self.events.trigger(
+                            |until| {
+                                if let WaitUntil::Acknowledged { seqn } = until {
+                                    seqn <= seg.ackn
+                                } else {
+                                    false
+                                }
+                            },
+                            Ok(()),
+                        );
                     }
                     if let ConnectionState::Established {
                         rx_state,
@@ -838,7 +822,8 @@ impl Socket {
                     log::trace!("Got FIN packet");
 
                     // Retry all recvs, which will not return ConnectionClosing after the buffer is empty
-                    self.trigger(|until| matches!(until, WaitUntil::Recv { .. }));
+                    self.events
+                        .trigger(|until| matches!(until, WaitUntil::Recv { .. }), Ok(()));
 
                     match self.connection_state {
                         ConnectionState::SynReceived => {
@@ -873,5 +858,119 @@ impl Socket {
                 }
             }
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ListenSocket {
+    queue: VecDeque<(RemoteAddr, SegmentMeta)>,
+    backlog: usize,
+    send_now: VecDeque<(RemoteAddr, SegmentMeta)>,
+    open: bool,
+    events: Events<()>,
+}
+
+impl ListenSocket {
+    /// New socket in initial state
+    pub fn call_listen(backlog: usize) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            backlog: backlog.max(1),
+            send_now: VecDeque::new(),
+            open: true,
+            events: Events::new(),
+        }
+    }
+
+    pub fn take_outbound(&mut self) -> Option<(RemoteAddr, SegmentMeta)> {
+        self.send_now.pop_front()
+    }
+
+    /// Request closing the socket
+    pub fn call_close(&mut self) {
+        log::trace!("call_close");
+
+        self.open = false;
+
+        // RST all queued connections
+        for (addr, seg) in self.queue.drain(..) {
+            self.send_now.push_back((
+                addr,
+                SegmentMeta {
+                    seqn: seg.ackn,
+                    ackn: 0,
+                    window: 0,
+                    flags: SegmentFlags::RST,
+                    data: Vec::new(),
+                },
+            ));
+        }
+    }
+
+    /// Request closing the socket
+    pub fn call_accept(&mut self) -> Result<(RemoteAddr, Socket), Error> {
+        log::trace!("call_close");
+
+        if !self.open {
+            return Err(Error::ConnectionClosing);
+        }
+
+        if let Some((addr, seg)) = self.queue.pop_front() {
+            let mut socket = Socket::new();
+            socket.set_state(ConnectionState::Listen);
+            socket.on_segment(seg);
+            Ok((addr, socket))
+        } else {
+            self.events.return_retry_after(())
+        }
+    }
+
+    /// Called on incoming segment
+    /// See RFC 793 page 64
+    pub fn on_segment(&mut self, addr: RemoteAddr, seg: SegmentMeta) {
+        log::trace!("on_segment {:?}", seg);
+
+        if seg.flags.contains(SegmentFlags::RST) {
+            return;
+        }
+
+        if seg.flags.contains(SegmentFlags::ACK) || !self.open {
+            self.send_now.push_back((
+                addr,
+                SegmentMeta {
+                    seqn: seg.ackn,
+                    ackn: 0,
+                    window: 0,
+                    flags: SegmentFlags::RST,
+                    data: Vec::new(),
+                },
+            ));
+            return;
+        }
+
+        if !seg.flags.contains(SegmentFlags::SYN) {
+            log::warn!("Invalid packet received, dropping");
+            return;
+        }
+
+        let queue_full = self.queue.len() >= self.backlog;
+
+        if queue_full {
+            log::debug!("Listen backlog full, dropping incoming connection");
+            self.send_now.push_back((
+                addr,
+                SegmentMeta {
+                    seqn: seg.ackn.wrapping_add(1),
+                    ackn: 0,
+                    window: 0,
+                    flags: SegmentFlags::ACK | SegmentFlags::RST,
+                    data: Vec::new(),
+                },
+            ));
+            return;
+        }
+
+        self.queue.push_back((addr, seg));
+        self.events.trigger(|()| true, Ok(()));
     }
 }

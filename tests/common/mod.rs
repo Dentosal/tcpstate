@@ -1,8 +1,14 @@
-#![allow(unused_macros)]
+#![allow(unused_macros, dead_code)]
+
+use std::io::Write;
 
 use tcpstate::*;
 
-use std::io::Write;
+#[macro_use]
+mod macros;
+pub mod scenario;
+
+pub use self::macros::*;
 
 pub mod color {
     macro_rules! ansi {
@@ -27,7 +33,7 @@ pub mod color {
 }
 
 pub fn init() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"))
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"))
         .format(|buf, record| {
             writeln!(
                 buf,
@@ -39,8 +45,7 @@ pub fn init() {
             )
         })
         .is_test(true)
-        .try_init()
-        .expect("Log init");
+        .try_init();
 }
 
 /// Forward packets from one socket to another
@@ -83,22 +88,4 @@ pub fn process(a: &mut Socket, b: &mut Socket) {
     }
     color::red();
     panic!("Communication round limit exceeded, possible loop outer");
-}
-
-macro_rules! expect_retry {
-    ($a:expr) => {
-        match $a {
-            Err(Error::RetryAfter(cookie)) => cookie,
-            other => panic!("Expected a retry cookie, got {:?}", other),
-        }
-    };
-}
-
-macro_rules! expect_continue {
-    ($a:expr) => {
-        match $a {
-            Err(Error::ContinueAfter(cookie)) => cookie,
-            other => panic!("Expected a continue cookie, got {:?}", other),
-        }
-    };
 }

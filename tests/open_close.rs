@@ -8,21 +8,7 @@ use common::*;
 fn tcp_open_close() {
     init();
 
-    let mut server = Socket::new();
-    let mut client = Socket::new();
-
-    server.options.nagle_delay = core::time::Duration::ZERO;
-    client.options.nagle_delay = core::time::Duration::ZERO;
-
-    // Establish connection
-
-    server.call_listen().expect("Error");
-
-    client.call_connect(RemoteAddr).expect("Error");
-    process(&mut server, &mut client);
-
-    assert_eq!(ConnectionState::FULLY_OPEN, client.state(), "client");
-    assert_eq!(ConnectionState::FULLY_OPEN, server.state(), "server");
+    let (mut server, mut client) = scenario::open_pair();
 
     // Close sockets
     client.call_close().expect("Error");

@@ -8,18 +8,7 @@ use common::*;
 fn tcp_simple_happy_path() {
     init();
 
-    let mut server = Socket::new();
-    let mut client = Socket::new();
-
-    server.options.nagle_delay = core::time::Duration::ZERO;
-    client.options.nagle_delay = core::time::Duration::ZERO;
-
-    // Establish connection
-
-    server.call_listen().expect("Error");
-
-    client.call_connect(RemoteAddr).expect("Error");
-    process(&mut server, &mut client);
+    let (mut server, mut client) = scenario::open_pair();
 
     // Send and recv exact amount of data
 

@@ -8,17 +8,7 @@ use common::*;
 fn tcp_simulteneous_close() {
     init();
 
-    let mut server = Socket::new();
-    let mut client = Socket::new();
-
-    // Establish connection
-
-    server.call_listen().expect("Error");
-    client.call_connect(RemoteAddr).expect("Error");
-    process(&mut server, &mut client);
-
-    assert_eq!(ConnectionState::FULLY_OPEN, client.state(), "client");
-    assert_eq!(ConnectionState::FULLY_OPEN, server.state(), "server");
+    let (mut server, mut client) = scenario::open_pair();
 
     // Close sockets simulteneously
     client.call_close().expect("Error");
