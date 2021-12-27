@@ -14,7 +14,7 @@ hashbrown = "0.11"
 
 [dev-dependencies]
 # Tests
-stderrlog = "0.5"
+env_logger = "0.9"
 
 # Examples
 #pnet = "0.28"

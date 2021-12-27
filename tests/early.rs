@@ -1,5 +1,6 @@
-use tcpstate::*;
+use tcpstate::{mock::*, options::*, *};
 
+#[macro_use]
 mod common;
 use common::*;
 
@@ -34,30 +35,44 @@ fn tcp_early_send_recv() {
     // Establish connection
     process(&mut server, &mut client);
 
-    assert_eq!(ConnectionState::Established, client.state(), "client");
-    assert_eq!(ConnectionState::Established, server.state(), "server");
+    assert_eq!(ConnectionState::FULLY_OPEN, client.state(), "client");
+    assert_eq!(ConnectionState::FULLY_OPEN, server.state(), "server");
 
-    // Check the the send call is done
+    // Check the the send call is not done yet
     client
         .try_wait_event(send_cookie)
-        .expect("send event not active");
+        .expect_err("send event not active");
 
     // Retry recv call
     server
         .try_wait_event(recv_cookie)
         .expect("send event not active");
 
-    let mut buffer = [0u8; 8];
     let n = server
         .call_recv(&mut buffer)
         .expect("recv failed even after the event");
     assert_eq!(&buffer[..n], b"Testing!");
 
+    // Send the ACK from the retry call
+    process(&mut server, &mut client);
+
+    assert_eq!(ConnectionState::FULLY_OPEN, client.state(), "client");
+    assert_eq!(ConnectionState::FULLY_OPEN, server.state(), "server");
+
+    // Check the the send call is done
+    client
+        .try_wait_event(send_cookie)
+        .expect("send event not active");
+
     // Close sockets
     client.call_close().expect("Error");
     process(&mut server, &mut client);
+    assert_eq!(server.call_recv(&mut [0u8; 1]), Ok(0)); // Read EOF
+    process(&mut server, &mut client);
 
     server.call_close().expect("Error");
+    process(&mut server, &mut client);
+    assert_eq!(client.call_recv(&mut [0u8; 1]), Ok(0)); // Read EOF
     process(&mut server, &mut client);
 
     let time_after = Instant::now().add(MAX_SEGMENT_LIFETIME * 3);

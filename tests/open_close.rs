@@ -5,7 +5,7 @@ mod common;
 use common::*;
 
 #[test]
-fn tcp_simple_happy_path() {
+fn tcp_open_close() {
     init();
 
     let mut server = Socket::new();
@@ -21,47 +21,19 @@ fn tcp_simple_happy_path() {
     client.call_connect(RemoteAddr).expect("Error");
     process(&mut server, &mut client);
 
-    // Send and recv exact amount of data
+    assert_eq!(ConnectionState::FULLY_OPEN, client.state(), "client");
+    assert_eq!(ConnectionState::FULLY_OPEN, server.state(), "server");
 
-    client.call_send(b"C=>S!".to_vec()).expect("Error");
-    process(&mut server, &mut client);
-
-    let mut buffer = [0u8; 5];
-    let n = server.call_recv(&mut buffer).expect("Error");
-    assert_eq!(&buffer[..n], b"C=>S!");
-    process(&mut server, &mut client);
-
-    // Send and recv partial
-
-    for _ in 0..4 {
-        client.call_send(b"Test!".to_vec()).expect("Error");
-    }
-    process(&mut server, &mut client);
-
-    let mut buffer = [0u8; 8];
-    let n = server.call_recv(&mut buffer).expect("Error");
-    assert_eq!(&buffer[..n], b"Test!Tes");
-
-    let n = server.call_recv(&mut buffer).expect("Error");
-    assert_eq!(&buffer[..n], b"t!Test!T");
-
-    let avail = server.recv_available();
-    let n = server.call_recv(&mut buffer[..avail]).expect("Error");
-    assert_eq!(&buffer[..n], b"est!");
-
-    // Close client socket
+    // Close sockets
     client.call_close().expect("Error");
     process(&mut server, &mut client);
     assert_eq!(server.call_recv(&mut [0u8; 1]), Ok(0)); // Read EOF
     process(&mut server, &mut client);
 
-    // Close server socket
     server.call_close().expect("Error");
     process(&mut server, &mut client);
     assert_eq!(client.call_recv(&mut [0u8; 1]), Ok(0)); // Read EOF
     process(&mut server, &mut client);
-
-    // Wait until sockets are closed
 
     let time_after = Instant::now().add(MAX_SEGMENT_LIFETIME * 3);
     server.on_time_tick(time_after);

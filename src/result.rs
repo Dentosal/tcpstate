@@ -5,6 +5,7 @@ pub enum Error {
     InvalidStateTransition,
     NotConnected,
     ConnectionReset,
+    OutputClosed,
     ConnectionClosing,
     /// Not an actual error
     /// Retry the tried call again after the cookie-event occurs.

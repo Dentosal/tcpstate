@@ -1,0 +1,94 @@
+use tcpstate::{mock::*, options::*, *};
+
+#[macro_use]
+mod common;
+use common::*;
+
+/// One sided FIN, like with HTTP/1.0 requests
+#[test]
+fn tcp_one_sided() {
+    init();
+
+    let mut server = Socket::new();
+    let mut client = Socket::new();
+
+    server.options.nagle_delay = core::time::Duration::ZERO;
+    client.options.nagle_delay = core::time::Duration::ZERO;
+
+    // Establish connection
+
+    server.call_listen().expect("Error");
+    client.call_connect(RemoteAddr).expect("Error");
+    process(&mut server, &mut client);
+
+    assert_eq!(ConnectionState::FULLY_OPEN, client.state(), "client");
+    assert_eq!(ConnectionState::FULLY_OPEN, server.state(), "server");
+
+    // Send request and send FIN
+
+    const REQUEST: &[u8] = b"GET / HTTP/1.0\r\n\r\n";
+    const REPLY: &[u8] = b"HTTP/1.0 200 OK\r\n\r\n";
+
+    client.call_send(REQUEST.to_vec()).expect("Error");
+    client.call_shutdown().expect("Error");
+
+    process(&mut server, &mut client);
+
+    // Read all data in small segments
+
+    let mut input: Vec<u8> = Vec::new();
+    let mut buffer = [0u8; 4];
+
+    loop {
+        let n = server.call_recv(&mut buffer).expect("Error");
+        input.extend(&buffer[..n]);
+        if n < buffer.len() {
+            break;
+        }
+    }
+
+    assert_eq!(&input, REQUEST);
+
+    process(&mut server, &mut client);
+
+    // Send response back in multiple packets and close socket
+
+    server.call_send(REPLY.to_vec()).expect("Error");
+
+    for _ in 0..6 {
+        server
+            .call_send(format!("Test!").as_bytes().to_vec())
+            .expect("Error");
+    }
+
+    server.call_shutdown().expect("close failed");
+
+    process(&mut server, &mut client);
+
+    // Read response to a big buffer
+
+    let mut buffer = [0u8; 1024];
+    let n = client.call_recv(&mut buffer).expect("Error");
+    assert!(n > REPLY.len());
+    assert_eq!(&buffer[..REPLY.len()], REPLY);
+    assert_eq!(&buffer[REPLY.len()..n], "Test!".repeat(6).as_bytes());
+
+    process(&mut server, &mut client);
+
+    // Read ack of closing the socket
+    assert_eq!(server.call_recv(&mut buffer), Ok(0));
+
+    process(&mut server, &mut client);
+
+    // Close sockets
+    server.call_close().expect("close failed");
+    client.call_close().expect("close failed");
+    process(&mut server, &mut client);
+
+    let time_after = Instant::now().add(MAX_SEGMENT_LIFETIME * 3);
+    server.on_time_tick(time_after);
+    client.on_time_tick(time_after);
+
+    assert_eq!(ConnectionState::Closed, client.state(), "client");
+    assert_eq!(ConnectionState::Closed, server.state(), "server");
+}
