@@ -1,6 +1,7 @@
+use alloc::boxed::Box;
 use hashbrown::{HashMap, HashSet};
 
-use crate::result::Error;
+use crate::{result::Error, EventHandler};
 
 //// MOCK /////////////////
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -36,21 +37,19 @@ pub(crate) enum WaitUntil {
     Acknowledged { seqn: u32 },
 }
 
-#[derive(Debug, Clone)]
 pub struct Events<Event: Copy + Eq + core::hash::Hash + core::fmt::Debug> {
     /// Suspended user queries waiting for condition
     pub(crate) suspended: HashSet<(Event, Cookie)>,
-    /// Suspended user queries ready for continuing
-    pub(crate) ready: HashMap<Cookie, Result<(), Error>>,
     next_cookie: Cookie,
+    handler: Box<EventHandler>,
 }
 
 impl<Event: Copy + Eq + core::hash::Hash + core::fmt::Debug> Events<Event> {
-    pub fn new() -> Self {
+    pub fn new(handler: Box<EventHandler>) -> Self {
         Self {
             suspended: HashSet::new(),
-            ready: HashMap::new(),
             next_cookie: Cookie::ZERO,
+            handler,
         }
     }
 
@@ -82,24 +81,7 @@ impl<Event: Copy + Eq + core::hash::Hash + core::fmt::Debug> Events<Event> {
     {
         for (_, cookie) in self.suspended.drain_filter(|(wait, _)| f(*wait)) {
             log::trace!("Triggered cookie {:?} result {:?}", cookie, r);
-            self.ready.insert(cookie, r);
-        }
-    }
-
-    /// Clear event if it is active.
-    /// Returns `Ok(())` if the event was active, an `Err(())` otherwise.
-    #[must_use]
-    pub fn try_wait(&mut self, cookie: Cookie) -> Result<(), Error> {
-        if let Some(result) = self.ready.remove(&cookie) {
-            log::trace!("Clearing cookie {:?} (result {:?})", cookie, result);
-            result
-        } else {
-            debug_assert!(
-                self.suspended.iter().any(|(_, c)| *c == cookie),
-                "Requested cookie is not present in either list"
-            );
-            log::trace!("Cookie {:?} was not ready", cookie);
-            Err(Error::EventNotActive)
+            (self.handler)(cookie, r);
         }
     }
 }

@@ -14,8 +14,6 @@ pub struct TxBuffer {
     /// Retransmit queue
     /// Invariant: ordered
     pub(crate) re_tx: VecDeque<SegmentMeta>,
-    /// Packets to be sent after the call
-    pub(crate) send_now: VecDeque<SegmentMeta>,
     /// Oldest unacknowledged sequence number
     pub unack: u32,
     /// Send sequence number to use when sending
@@ -49,13 +47,12 @@ impl TxBuffer {
         self.unack < ackn && ackn <= self.next
     }
 
-    pub fn send(&mut self, seg: SegmentMeta) {
+    pub fn on_send(&mut self, seg: SegmentMeta) {
         log::trace!("Sending {:?}", seg);
 
         self.next = self.next.wrapping_add(seg.seq_size());
 
-        self.re_tx.push_back(seg.clone());
-        self.send_now.push_back(seg);
+        self.re_tx.push_back(seg);
     }
 }
 
@@ -64,7 +61,6 @@ impl Default for TxBuffer {
         Self {
             tx: BlobQueue::default(),
             re_tx: VecDeque::new(),
-            send_now: VecDeque::new(),
             unack: 0,
             next: 0,
             window: INITIAL_WINDOW_SIZE,

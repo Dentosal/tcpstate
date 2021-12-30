@@ -7,6 +7,7 @@ pub enum Error {
     ConnectionReset,
     OutputClosed,
     ConnectionClosing,
+    ListenClosed,
     EventNotActive,
     /// Not an actual error
     /// Retry the tried call again after the cookie-event occurs.

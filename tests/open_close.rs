@@ -8,18 +8,18 @@ use common::*;
 fn tcp_open_close() {
     init();
 
-    let (mut server, mut client) = scenario::open_pair();
+    let (server, client, mut communicate) = scenario::manual::open_pair();
 
     // Close sockets
     client.call_close().expect("Error");
-    process(&mut server, &mut client);
+    communicate();
     assert_eq!(server.call_recv(&mut [0u8; 1]), Ok(0)); // Read EOF
-    process(&mut server, &mut client);
+    communicate();
 
     server.call_close().expect("Error");
-    process(&mut server, &mut client);
+    communicate();
     assert_eq!(client.call_recv(&mut [0u8; 1]), Ok(0)); // Read EOF
-    process(&mut server, &mut client);
+    communicate();
 
     let time_after = Instant::now().add(MAX_SEGMENT_LIFETIME * 3);
     server.on_time_tick(time_after);

@@ -18,6 +18,7 @@ extern crate alloc;
 
 use core::time::Duration;
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
@@ -73,8 +74,15 @@ pub fn response_to_closed(seg: SegmentMeta) -> SegmentMeta {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Socket {
+pub type EventHandler = dyn FnMut(Cookie, Result<(), Error>) + Send;
+pub type PacketHandler = dyn FnMut(RemoteAddr, SegmentMeta) + Send;
+
+pub trait UserData {
+    fn send(&mut self, dst: RemoteAddr, seg: SegmentMeta);
+}
+
+pub struct Socket<U: UserData> {
+    remote: Option<RemoteAddr>,
     connection_state: ConnectionState,
     dup_ack_count: u8,
     congestation_window: u16,
@@ -85,12 +93,14 @@ pub struct Socket {
     timers: Timers,
     events: Events<WaitUntil>,
     pub options: SocketOptions,
+    user_data: U,
 }
 
-impl Socket {
+impl<U: UserData> Socket<U> {
     /// New socket in initial state
-    pub fn new() -> Self {
+    pub fn new(event_handler: Box<EventHandler>, user_data: U) -> Self {
         Self {
+            remote: None,
             connection_state: ConnectionState::Closed,
             dup_ack_count: 0,
             congestation_window: INITIAL_WINDOW_SIZE,
@@ -99,8 +109,9 @@ impl Socket {
             tx: TxBuffer::default(),
             timings: Timings::default(),
             timers: Timers::default(),
-            events: Events::new(),
+            events: Events::new(event_handler),
             options: SocketOptions::default(),
+            user_data,
         }
     }
 
@@ -154,7 +165,16 @@ impl Socket {
             self.connection_state,
             ConnectionState::Closed
         );
-        *self = Self::new();
+
+        self.connection_state = ConnectionState::Closed;
+        self.dup_ack_count = 0;
+        self.congestation_window = INITIAL_WINDOW_SIZE;
+        self.exp_backoff = 1;
+        self.rx = RxBuffer::default();
+        self.tx = TxBuffer::default();
+        self.timings = Timings::default();
+        self.timers = Timers::default();
+        self.events.trigger(|_| true, Err(Error::ConnectionClosing));
     }
 
     fn reset(&mut self) {
@@ -163,7 +183,7 @@ impl Socket {
             self.connection_state,
             ConnectionState::Reset
         );
-        *self = Self::new();
+        self.clear();
         self.connection_state = ConnectionState::Reset;
     }
 
@@ -214,34 +234,27 @@ impl Socket {
         }
     }
 
-    /// Clear event if it is active.
-    /// Returns `Ok(())` if the event was active, an `Err(())` otherwise.
-    pub fn try_wait_event(&mut self, cookie: Cookie) -> Result<(), Error> {
-        self.events.try_wait(cookie)
-    }
-
-    pub fn take_outbound(&mut self) -> Option<SegmentMeta> {
-        self.tx.send_now.pop_front()
-    }
-
     /// Establish a connection
     pub fn call_connect(&mut self, remote: RemoteAddr) -> Result<(), Error> {
         log::trace!("state: {:?}", self.connection_state);
         log::trace!("call_connect {:?}", remote);
-        debug_assert!(self.events.ready.is_empty());
         if matches!(
             self.connection_state,
             ConnectionState::Closed | ConnectionState::Reset
         ) {
+            self.remote = Some(remote);
             self.set_state(ConnectionState::SynSent);
             self.tx.init();
-            self.tx.send_now.push_back(SegmentMeta {
-                seqn: self.tx.init_seqn,
-                ackn: 0,
-                window: self.rx.window_size(),
-                flags: SegmentFlags::SYN,
-                data: Vec::new(),
-            });
+            self.user_data.send(
+                remote,
+                SegmentMeta {
+                    seqn: self.tx.init_seqn,
+                    ackn: 0,
+                    window: self.rx.window_size(),
+                    flags: SegmentFlags::SYN,
+                    data: Vec::new(),
+                },
+            );
             self.events.return_continue_after(WaitUntil::Established)
         } else {
             Err(Error::InvalidStateTransition)
@@ -254,7 +267,6 @@ impl Socket {
         log::trace!("call_send {:?}", input_data);
         log::trace!("state: {:?}", self.connection_state);
         assert!(!input_data.is_empty());
-        debug_assert!(self.events.ready.is_empty());
         match self.connection_state {
             ConnectionState::Reset => Err(Error::ConnectionReset),
             ConnectionState::Closed | ConnectionState::Listen => Err(Error::NotConnected),
@@ -293,7 +305,6 @@ impl Socket {
     pub fn call_recv(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
         log::trace!("call_recv len={}", buffer.len());
         log::trace!("state: {:?}", self.connection_state);
-        debug_assert!(self.events.ready.is_empty());
         match self.connection_state {
             ConnectionState::Reset => Err(Error::ConnectionReset),
             ConnectionState::Closed => Err(Error::NotConnected),
@@ -391,7 +402,6 @@ impl Socket {
     pub fn call_shutdown(&mut self) -> Result<(), Error> {
         log::trace!("call_shutdown");
         log::trace!("state: {:?}", self.connection_state);
-        debug_assert!(self.events.ready.is_empty());
         match self.connection_state {
             ConnectionState::Reset => Err(Error::ConnectionReset),
             ConnectionState::Closed => Err(Error::NotConnected),
@@ -422,7 +432,6 @@ impl Socket {
     pub fn call_close(&mut self) -> Result<(), Error> {
         log::trace!("call_close");
         log::trace!("state: {:?}", self.connection_state);
-        debug_assert!(self.events.ready.is_empty());
         match self.connection_state {
             ConnectionState::Reset => Err(Error::ConnectionReset),
             ConnectionState::Closed => Err(Error::NotConnected),
@@ -458,10 +467,10 @@ impl Socket {
     }
 
     /// Request closing the socket
+    /// Will never block to wait for completion of ongoing calls
     pub fn call_abort(&mut self) -> Result<(), Error> {
         log::trace!("call_abort");
         log::trace!("state: {:?}", self.connection_state);
-        debug_assert!(self.events.ready.is_empty());
         match self.connection_state {
             ConnectionState::Reset => Err(Error::ConnectionReset),
             ConnectionState::Closed => Err(Error::NotConnected),
@@ -474,13 +483,16 @@ impl Socket {
                 Ok(())
             }
             ConnectionState::SynReceived | ConnectionState::Established { .. } => {
-                self.tx.send_now.push_back(SegmentMeta {
-                    seqn: self.tx.next,
-                    ackn: 0,
-                    window: self.rx.window_size(),
-                    flags: SegmentFlags::RST,
-                    data: Vec::new(),
-                });
+                self.user_data.send(
+                    self.remote.expect("No remote set"),
+                    SegmentMeta {
+                        seqn: self.tx.next,
+                        ackn: 0,
+                        window: self.rx.window_size(),
+                        flags: SegmentFlags::RST,
+                        data: Vec::new(),
+                    },
+                );
                 let mut r = Ok(());
 
                 let queued_sends = todo!("Queued sends");
@@ -521,13 +533,17 @@ impl Socket {
             SegmentFlags::ACK
         };
 
-        self.tx.send(SegmentMeta {
+        let seg = SegmentMeta {
             seqn: self.tx.next,
             ackn: self.rx.curr_ackn(),
             window: self.rx.window_size(),
             flags,
             data: tx_data,
-        });
+        };
+
+        self.tx.on_send(seg.clone());
+        self.user_data
+            .send(self.remote.expect("No remote set"), seg);
 
         if len != 0 {
             self.timers.re_tx = Some(Instant::now().add(self.timings.rto));
@@ -542,7 +558,8 @@ impl Socket {
 
         match self.connection_state {
             ConnectionState::Closed | ConnectionState::Reset => {
-                self.tx.send_now.push_back(response_to_closed(seg));
+                self.user_data
+                    .send(self.remote.expect("No remote set"), response_to_closed(seg));
             }
             ConnectionState::Listen => {
                 if seg.flags.contains(SegmentFlags::RST) {
@@ -550,13 +567,16 @@ impl Socket {
                 }
 
                 if seg.flags.contains(SegmentFlags::ACK) {
-                    self.tx.send_now.push_back(SegmentMeta {
-                        seqn: seg.ackn,
-                        ackn: 0,
-                        window: 0,
-                        flags: SegmentFlags::RST,
-                        data: Vec::new(),
-                    });
+                    self.user_data.send(
+                        self.remote.expect("No remote set"),
+                        SegmentMeta {
+                            seqn: seg.ackn,
+                            ackn: 0,
+                            window: 0,
+                            flags: SegmentFlags::RST,
+                            data: Vec::new(),
+                        },
+                    );
                     return;
                 }
 
@@ -573,13 +593,16 @@ impl Socket {
                 self.tx.next = seqn.wrapping_add(1);
                 self.tx.unack = seqn;
                 self.set_state(ConnectionState::SynReceived);
-                self.tx.send_now.push_back(SegmentMeta {
-                    seqn,
-                    ackn: self.rx.curr_ackn(),
-                    window: self.rx.window_size(),
-                    flags: SegmentFlags::SYN | SegmentFlags::ACK,
-                    data: Vec::new(),
-                });
+                self.user_data.send(
+                    self.remote.expect("No remote set"),
+                    SegmentMeta {
+                        seqn,
+                        ackn: self.rx.curr_ackn(),
+                        window: self.rx.window_size(),
+                        flags: SegmentFlags::SYN | SegmentFlags::ACK,
+                        data: Vec::new(),
+                    },
+                );
             }
 
             ConnectionState::SynSent => {
@@ -587,13 +610,16 @@ impl Socket {
                     if (seg.ackn <= self.tx.init_seqn || seg.ackn > self.tx.next)
                         && !(seg.ackn <= self.tx.unack && seg.ackn <= self.tx.next)
                     {
-                        self.tx.send_now.push_back(SegmentMeta {
-                            seqn: seg.ackn,
-                            ackn: 0,
-                            window: self.rx.window_size(),
-                            flags: SegmentFlags::RST,
-                            data: Vec::new(),
-                        });
+                        self.user_data.send(
+                            self.remote.expect("No remote set"),
+                            SegmentMeta {
+                                seqn: seg.ackn,
+                                ackn: 0,
+                                window: self.rx.window_size(),
+                                flags: SegmentFlags::RST,
+                                data: Vec::new(),
+                            },
+                        );
                         return;
                     }
                 }
@@ -614,13 +640,16 @@ impl Socket {
                     } else {
                         todo!("If packet has data, queue it until ESTABLISHED");
                         self.set_state(ConnectionState::SynReceived);
-                        self.tx.send_now.push_back(SegmentMeta {
-                            seqn: self.tx.init_seqn,
-                            ackn: self.rx.curr_ackn(),
-                            window: self.rx.window_size(),
-                            flags: SegmentFlags::SYN | SegmentFlags::ACK,
-                            data: Vec::new(),
-                        });
+                        self.user_data.send(
+                            self.remote.expect("No remote set"),
+                            SegmentMeta {
+                                seqn: self.tx.init_seqn,
+                                ackn: self.rx.curr_ackn(),
+                                window: self.rx.window_size(),
+                                flags: SegmentFlags::SYN | SegmentFlags::ACK,
+                                data: Vec::new(),
+                            },
+                        );
                     }
                 }
             }
@@ -628,13 +657,16 @@ impl Socket {
                 if !self.check_segment_seq_ok(&seg) {
                     log::trace!("RST!!");
                     if !seg.flags.contains(SegmentFlags::RST) {
-                        self.tx.send_now.push_back(SegmentMeta {
-                            seqn: self.tx.next,
-                            ackn: self.rx.curr_ackn(),
-                            window: 0,
-                            flags: SegmentFlags::ACK,
-                            data: Vec::new(),
-                        });
+                        self.user_data.send(
+                            self.remote.expect("No remote set"),
+                            SegmentMeta {
+                                seqn: self.tx.next,
+                                ackn: self.rx.curr_ackn(),
+                                window: 0,
+                                flags: SegmentFlags::ACK,
+                                data: Vec::new(),
+                            },
+                        );
                     }
                 } else if seg.flags.contains(SegmentFlags::RST) {
                     self.clear();
@@ -648,13 +680,16 @@ impl Socket {
                         todo!("set timewait 2MSL");
                     }
                 } else {
-                    self.tx.send_now.push_back(SegmentMeta {
-                        seqn: self.tx.next,
-                        ackn: 0,
-                        window: 0,
-                        flags: SegmentFlags::RST,
-                        data: Vec::new(),
-                    });
+                    self.user_data.send(
+                        self.remote.expect("No remote set"),
+                        SegmentMeta {
+                            seqn: self.tx.next,
+                            ackn: 0,
+                            window: 0,
+                            flags: SegmentFlags::RST,
+                            data: Vec::new(),
+                        },
+                    );
 
                     todo!("Signal connection reset to pending reads/writes");
 
@@ -667,13 +702,16 @@ impl Socket {
                 if !self.check_segment_seq_ok(&seg) {
                     log::trace!("Non-acceptable segment {:#?}", seg);
                     if !seg.flags.contains(SegmentFlags::RST) {
-                        self.tx.send_now.push_back(SegmentMeta {
-                            seqn: self.tx.next,
-                            ackn: self.rx.curr_ackn(),
-                            window: self.rx.window_size(),
-                            flags: SegmentFlags::ACK,
-                            data: Vec::new(),
-                        });
+                        self.user_data.send(
+                            self.remote.expect("No remote set"),
+                            SegmentMeta {
+                                seqn: self.tx.next,
+                                ackn: self.rx.curr_ackn(),
+                                window: self.rx.window_size(),
+                                flags: SegmentFlags::ACK,
+                                data: Vec::new(),
+                            },
+                        );
                     }
                     return;
                 }
@@ -709,13 +747,16 @@ impl Socket {
                     todo!("Pending RECV/SEND calls: signal error ConnectionReset");
 
                     // Error! Send reset, flush all queues
-                    self.tx.send_now.push_back(SegmentMeta {
-                        seqn: self.tx.next,
-                        ackn: 0,
-                        window: self.rx.window_size(),
-                        flags: SegmentFlags::RST,
-                        data: Vec::new(),
-                    });
+                    self.user_data.send(
+                        self.remote.expect("No remote set"),
+                        SegmentMeta {
+                            seqn: self.tx.next,
+                            ackn: 0,
+                            window: self.rx.window_size(),
+                            flags: SegmentFlags::RST,
+                            data: Vec::new(),
+                        },
+                    );
 
                     todo!("Return error?");
                 }
@@ -861,40 +902,41 @@ impl Socket {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ListenSocket {
+pub struct ListenSocket<U: UserData> {
     queue: VecDeque<(RemoteAddr, SegmentMeta)>,
     backlog: usize,
-    send_now: VecDeque<(RemoteAddr, SegmentMeta)>,
     open: bool,
     events: Events<()>,
+    user_data: U,
 }
 
-impl ListenSocket {
+impl<U: UserData> ListenSocket<U> {
     /// New socket in initial state
-    pub fn call_listen(backlog: usize) -> Self {
+    pub fn call_listen(backlog: usize, event_handler: Box<EventHandler>, user_data: U) -> Self {
         Self {
             queue: VecDeque::new(),
             backlog: backlog.max(1),
-            send_now: VecDeque::new(),
             open: true,
-            events: Events::new(),
+            events: Events::new(event_handler),
+            user_data,
         }
     }
 
-    pub fn take_outbound(&mut self) -> Option<(RemoteAddr, SegmentMeta)> {
-        self.send_now.pop_front()
-    }
-
     /// Request closing the socket
+    /// Will cancel ongoing listen if any in progress
     pub fn call_close(&mut self) {
         log::trace!("call_close");
 
         self.open = false;
 
+        self.events.trigger(|()| true, Err(Error::ListenClosed));
+
         // RST all queued connections
+        if !self.queue.is_empty() {
+            log::trace!("Listen socket closed, sending RST to all queued connections");
+        }
         for (addr, seg) in self.queue.drain(..) {
-            self.send_now.push_back((
+            self.user_data.send(
                 addr,
                 SegmentMeta {
                     seqn: seg.ackn,
@@ -903,20 +945,26 @@ impl ListenSocket {
                     flags: SegmentFlags::RST,
                     data: Vec::new(),
                 },
-            ));
+            );
         }
     }
 
-    /// Request closing the socket
-    pub fn call_accept(&mut self) -> Result<(RemoteAddr, Socket), Error> {
-        log::trace!("call_close");
+    /// Accept a new connection from the backlog
+    pub fn call_accept<N: UserData, D: FnOnce() -> N>(
+        &mut self,
+        event_handler: Box<EventHandler>,
+        make_user_data: D,
+    ) -> Result<(RemoteAddr, Socket<N>), Error> {
+        log::trace!("call_accept");
 
         if !self.open {
             return Err(Error::ConnectionClosing);
         }
 
         if let Some((addr, seg)) = self.queue.pop_front() {
-            let mut socket = Socket::new();
+            let user_data = make_user_data();
+            let mut socket = Socket::new(event_handler, user_data);
+            socket.remote = Some(addr);
             socket.set_state(ConnectionState::Listen);
             socket.on_segment(seg);
             Ok((addr, socket))
@@ -935,7 +983,12 @@ impl ListenSocket {
         }
 
         if seg.flags.contains(SegmentFlags::ACK) || !self.open {
-            self.send_now.push_back((
+            if self.open {
+                log::trace!("Listen socket received ACK, responding with RST");
+            } else {
+                log::trace!("Listen socket iu closed, responding with RST");
+            }
+            self.user_data.send(
                 addr,
                 SegmentMeta {
                     seqn: seg.ackn,
@@ -944,7 +997,7 @@ impl ListenSocket {
                     flags: SegmentFlags::RST,
                     data: Vec::new(),
                 },
-            ));
+            );
             return;
         }
 
@@ -957,7 +1010,7 @@ impl ListenSocket {
 
         if queue_full {
             log::debug!("Listen backlog full, dropping incoming connection");
-            self.send_now.push_back((
+            self.user_data.send(
                 addr,
                 SegmentMeta {
                     seqn: seg.ackn.wrapping_add(1),
@@ -966,7 +1019,7 @@ impl ListenSocket {
                     flags: SegmentFlags::ACK | SegmentFlags::RST,
                     data: Vec::new(),
                 },
-            ));
+            );
             return;
         }
 

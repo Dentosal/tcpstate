@@ -9,7 +9,7 @@ use common::*;
 fn tcp_one_sided() {
     init();
 
-    let (mut server, mut client) = scenario::open_pair();
+    let (server, client, mut communicate) = scenario::manual::open_pair();
 
     // Send request and send FIN
 
@@ -19,7 +19,7 @@ fn tcp_one_sided() {
     client.call_send(REQUEST.to_vec()).expect("Error");
     client.call_shutdown().expect("Error");
 
-    process(&mut server, &mut client);
+    communicate();
 
     // Read all data in small segments
 
@@ -36,7 +36,7 @@ fn tcp_one_sided() {
 
     assert_eq!(&input, REQUEST);
 
-    process(&mut server, &mut client);
+    communicate();
 
     // Send response back in multiple packets and close socket
 
@@ -50,7 +50,7 @@ fn tcp_one_sided() {
 
     server.call_shutdown().expect("close failed");
 
-    process(&mut server, &mut client);
+    communicate();
 
     // Read response to a big buffer
 
@@ -60,17 +60,17 @@ fn tcp_one_sided() {
     assert_eq!(&buffer[..REPLY.len()], REPLY);
     assert_eq!(&buffer[REPLY.len()..n], "Test!".repeat(6).as_bytes());
 
-    process(&mut server, &mut client);
+    communicate();
 
     // Read ack of closing the socket
     assert_eq!(server.call_recv(&mut buffer), Ok(0));
 
-    process(&mut server, &mut client);
+    communicate();
 
     // Close sockets
     server.call_close().expect("close failed");
     client.call_close().expect("close failed");
-    process(&mut server, &mut client);
+    communicate();
 
     let time_after = Instant::now().add(MAX_SEGMENT_LIFETIME * 3);
     server.on_time_tick(time_after);

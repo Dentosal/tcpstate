@@ -1,7 +1,7 @@
 use crate::mock::Instant;
 
 use crate::state::ConnectionState;
-use crate::Socket;
+use crate::{Socket, UserData};
 
 /// Timings per https://datatracker.ietf.org/doc/html/rfc6298
 #[derive(Debug, Clone, Default)]
@@ -16,7 +16,7 @@ impl Timers {
     }
 }
 
-impl Socket {
+impl<U: UserData> Socket<U> {
     pub(crate) fn on_timer_re_tx(&mut self) {
         log::trace!("on_timer_re_tx");
         match self.connection_state {
