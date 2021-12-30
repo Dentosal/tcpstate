@@ -4,12 +4,8 @@
 #![feature(default_free_fn, duration_constants, let_else, drain_filter)]
 #![allow(dead_code, unreachable_code)]
 #![deny(unused_must_use)]
+#![forbid(unsafe_code)]
 
-//! TODO: Return Error vs Signal User
-//! TODO: Window scaling
-//! TODO: Wrapping comparisons with windows
-//! TODO: std-compat
-//! TODO: buffer size limits (configurable)
 //! TODO: don't clear_range for SYN,FIN
 //! TODO: re_tx FIN
 //! TODO: Accept new connection in TimeWait state as per RFC 1122 page 88
