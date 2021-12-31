@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 
-use tcpstate::{mock::RemoteAddr, SegmentMeta};
+use tcpstate::{mock::RemoteAddr, Cookie, Error, SegmentMeta};
 
 pub struct Packet {
     pub src: RemoteAddr,
@@ -12,10 +12,35 @@ pub struct Packet {
 }
 
 #[derive(Clone)]
+pub struct Event<T> {
+    tx: Sender<T>,
+    rx: Receiver<T>,
+}
+impl<T> Event<T> {
+    pub fn new() -> Self {
+        let (tx, rx) = bounded(0);
+        Self { tx, rx }
+    }
+
+    pub fn trigger(&self, value: T) {
+        println!("trigger event");
+        self.tx.send(value).unwrap();
+    }
+
+    #[must_use]
+    pub fn wait(&self) -> T {
+        println!("wait event");
+        self.rx.recv().unwrap()
+    }
+}
+
+#[derive(Clone)]
 pub struct HostHandler {
     local: RemoteAddr,
     hosts: Arc<RwLock<HashMap<RemoteAddr, Sender<Packet>>>>,
+    pub(crate) event: Event<(Cookie, Result<(), Error>)>,
 }
+
 impl tcpstate::UserData for HostHandler {
     fn send(&mut self, dst: RemoteAddr, seg: SegmentMeta) {
         if let Some(host) = self.hosts.read().unwrap().get(&dst) {
@@ -28,6 +53,10 @@ impl tcpstate::UserData for HostHandler {
         } else {
             panic!("Host {:?} doesn't exist", dst)
         }
+    }
+
+    fn event(&mut self, cookie: Cookie, result: Result<(), Error>) {
+        self.event.trigger((cookie, result));
     }
 }
 
@@ -52,7 +81,16 @@ impl Network {
         self.hosts.write().unwrap().insert(addr, tx);
         self.handles.write().unwrap().insert(
             addr,
-            thread::spawn(move || f(HostHandler { local: addr, hosts }, rx)),
+            thread::spawn(move || {
+                f(
+                    HostHandler {
+                        local: addr,
+                        hosts,
+                        event: Event::new(),
+                    },
+                    rx,
+                )
+            }),
         );
         addr
     }

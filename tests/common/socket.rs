@@ -12,43 +12,20 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-pub struct Event<T> {
-    tx: Sender<T>,
-    rx: Receiver<T>,
-}
-impl<T> Event<T> {
-    pub fn new() -> Self {
-        let (tx, rx) = bounded(0);
-        Self { tx, rx }
-    }
-
-    pub fn trigger(&self, value: T) {
-        self.tx.send(value).unwrap();
-    }
-
-    #[must_use]
-    pub fn wait(&self) -> T {
-        self.rx.recv().unwrap()
-    }
-}
+use super::sim_net::Event;
 
 pub struct ListenCtx {
     pub socket: Arc<Mutex<ListenSocket<HostHandler>>>,
-    event: Arc<Event<Result<(), Error>>>,
+    event: Event<(Cookie, Result<(), Error>)>,
     map: Arc<Mutex<HashMap<RemoteAddr, Sender<Packet>>>>,
-    host_handler: HostHandler,
     _handle: JoinHandle<()>,
 }
 
 impl ListenCtx {
     pub fn new(backlog: usize, host_handler: HostHandler, rx: Receiver<sim_net::Packet>) -> Self {
-        let event = Arc::new(Event::new());
-        let arc_event = event.clone();
+        let event = host_handler.event.clone();
         let socket = Arc::new(Mutex::new(ListenSocket::call_listen(
             backlog,
-            Box::new(move |_, result| {
-                arc_event.trigger(result);
-            }),
             host_handler.clone(),
         )));
 
@@ -73,9 +50,12 @@ impl ListenCtx {
             socket,
             event,
             map,
-            host_handler,
             _handle,
         }
+    }
+
+    fn wait_event(&self) -> Result<(), Error> {
+        self.event.wait().1
     }
 
     pub fn call_ret<T, F: FnMut(&mut ListenSocket<HostHandler>) -> Result<T, Error>>(
@@ -88,7 +68,7 @@ impl ListenCtx {
                 f(&mut *guard)
             };
             match r {
-                Err(Error::RetryAfter(_)) => self.event.wait()?,
+                Err(Error::RetryAfter(_)) => self.wait_event()?,
                 Err(Error::ContinueAfter(_)) => todo!("Error"),
                 other => return other,
             }
@@ -105,9 +85,9 @@ impl ListenCtx {
                 f(&mut *guard)
             };
             match r {
-                Err(Error::RetryAfter(_)) => self.event.wait()?,
+                Err(Error::RetryAfter(_)) => self.wait_event()?,
                 Err(Error::ContinueAfter(_)) => {
-                    return self.event.wait();
+                    return self.wait_event();
                 }
                 other => return other,
             }
@@ -115,48 +95,31 @@ impl ListenCtx {
     }
 
     pub fn accept(&self) -> Result<(RemoteAddr, SocketCtx), Error> {
-        let event = Arc::new(Event::new());
-        let arc_event = event.clone();
-        let (addr, s) = self.call_ret(move |s| {
-            let arc_event = arc_event.clone();
-            s.call_accept(Box::new(move |_, r| arc_event.trigger(r)), || {
-                self.host_handler.clone()
-            })
+        let (addr, s) = self.call_ret(|s| {
+            let mut host_handler = s.user_data.clone();
+            host_handler.event = Event::new(); // Detach events
+            s.call_accept(move || host_handler)
         })?;
 
         let (tx, rx) = bounded(10);
         let mut m = self.map.lock().unwrap();
         m.insert(addr, tx);
-        Ok((addr, SocketCtx::from_socket(rx, event, s)))
+        Ok((addr, SocketCtx::from_socket(rx, s)))
     }
 }
 pub struct SocketCtx {
     socket: Arc<Mutex<Socket<HostHandler>>>,
-    event: Arc<Event<Result<(), Error>>>,
+    event: Event<(Cookie, Result<(), Error>)>,
     _handle: JoinHandle<()>,
 }
 
 impl SocketCtx {
     pub fn new(host_handler: HostHandler, rx: Receiver<Packet>) -> Self {
-        let event = Arc::new(Event::new());
-        let arc_event = event.clone();
-        Self::from_socket(
-            rx,
-            event,
-            Socket::new(
-                Box::new(move |_, result| {
-                    arc_event.trigger(result);
-                }),
-                host_handler,
-            ),
-        )
+        Self::from_socket(rx, Socket::new(host_handler))
     }
 
-    pub fn from_socket(
-        rx: Receiver<Packet>,
-        event: Arc<Event<Result<(), Error>>>,
-        socket: Socket<HostHandler>,
-    ) -> Self {
+    pub fn from_socket(rx: Receiver<Packet>, socket: Socket<HostHandler>) -> Self {
+        let event = socket.user_data.event.clone();
         let socket = Arc::new(Mutex::new(socket));
         let arc_socket = socket.clone();
         let handle = thread::spawn(move || loop {
@@ -171,6 +134,11 @@ impl SocketCtx {
             _handle: handle,
         }
     }
+
+    fn wait_event(&self) -> Result<(), Error> {
+        self.event.wait().1
+    }
+
     pub fn call_ret<T, F: FnMut(&mut Socket<HostHandler>) -> Result<T, Error>>(
         &self,
         mut f: F,
@@ -181,7 +149,7 @@ impl SocketCtx {
                 f(&mut *guard)
             };
             match r {
-                Err(Error::RetryAfter(_)) => self.event.wait()?,
+                Err(Error::RetryAfter(_)) => self.wait_event()?,
                 Err(Error::ContinueAfter(_)) => todo!("Error"),
                 other => return other,
             }
@@ -198,9 +166,9 @@ impl SocketCtx {
                 f(&mut *guard)
             };
             match r {
-                Err(Error::RetryAfter(_)) => self.event.wait()?,
+                Err(Error::RetryAfter(_)) => self.wait_event()?,
                 Err(Error::ContinueAfter(_)) => {
-                    return self.event.wait();
+                    return self.wait_event();
                 }
                 other => return other,
             }

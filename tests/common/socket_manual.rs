@@ -16,12 +16,14 @@ use crate::sim_net::Packet;
 pub struct ManualHandler {
     pub local: RemoteAddr,
     queue: Arc<Mutex<VecDeque<Packet>>>,
+    event: Option<Result<(), Error>>,
 }
 impl ManualHandler {
     pub fn new() -> Self {
         Self {
             local: RemoteAddr::new(),
             queue: Arc::new(Mutex::new(VecDeque::new())),
+            event: None,
         }
     }
 
@@ -37,24 +39,22 @@ impl UserData for ManualHandler {
             seg,
         });
     }
+
+    fn event(&mut self, _: Cookie, result: Result<(), Error>) {
+        self.event = Some(result);
+    }
 }
 
 pub struct ListenCtx {
     pub socket: Arc<Mutex<ListenSocket<ManualHandler>>>,
-    event: Arc<Mutex<Option<Result<(), Error>>>>,
     map: Arc<Mutex<HashMap<RemoteAddr, Box<dyn FnMut(Packet)>>>>,
     host_handler: ManualHandler,
 }
 
 impl ListenCtx {
     pub fn new(backlog: usize, host_handler: ManualHandler) -> (Self, impl FnMut(Packet)) {
-        let event = Arc::new(Mutex::new(None));
-        let arc_event = event.clone();
         let socket = Arc::new(Mutex::new(ListenSocket::call_listen(
             backlog,
-            Box::new(move |_, result| {
-                *arc_event.lock().unwrap() = Some(result);
-            }),
             host_handler.clone(),
         )));
 
@@ -76,7 +76,6 @@ impl ListenCtx {
         (
             Self {
                 socket,
-                event,
                 map,
                 host_handler,
             },
@@ -85,8 +84,8 @@ impl ListenCtx {
     }
 
     pub fn consume_event(&self) {
-        let mut event = self.event.lock().unwrap();
-        let _ = event.take().expect("No event active");
+        let mut s = self.socket.lock().unwrap();
+        let _ = s.user_data.event.take().expect("No event active");
     }
 
     pub fn call<T, F: FnMut(&mut ListenSocket<ManualHandler>) -> Result<T, Error>>(
@@ -98,19 +97,9 @@ impl ListenCtx {
     }
 
     pub fn accept(&self) -> Result<(RemoteAddr, SocketCtx), Error> {
-        let event = Arc::new(Mutex::new(None));
-        let arc_event = event.clone();
-        let (addr, s) = self.call(move |s| {
-            let arc_event = arc_event.clone();
-            s.call_accept(
-                Box::new(move |_, r| {
-                    *arc_event.lock().unwrap() = Some(r);
-                }),
-                || self.host_handler.clone(),
-            )
-        })?;
+        let (addr, s) = self.call(move |s| s.call_accept(|| self.host_handler.clone()))?;
 
-        let (socket, s_on_packet) = SocketCtx::from_socket(event, s);
+        let (socket, s_on_packet) = SocketCtx::from_socket(s);
         let mut m = self.map.lock().unwrap();
         m.insert(addr, Box::new(s_on_packet));
         Ok((addr, socket))
@@ -118,28 +107,14 @@ impl ListenCtx {
 }
 pub struct SocketCtx {
     pub socket: Arc<Mutex<Socket<ManualHandler>>>,
-    event: Arc<Mutex<Option<Result<(), Error>>>>,
 }
 
 impl SocketCtx {
     pub fn new(host_handler: ManualHandler) -> (Self, impl FnMut(Packet)) {
-        let event = Arc::new(Mutex::new(None));
-        let arc_event = event.clone();
-        Self::from_socket(
-            event,
-            Socket::new(
-                Box::new(move |_, result| {
-                    *arc_event.lock().unwrap() = Some(result);
-                }),
-                host_handler,
-            ),
-        )
+        Self::from_socket(Socket::new(host_handler))
     }
 
-    pub fn from_socket(
-        event: Arc<Mutex<Option<Result<(), Error>>>>,
-        socket: Socket<ManualHandler>,
-    ) -> (Self, impl FnMut(Packet)) {
+    pub fn from_socket(socket: Socket<ManualHandler>) -> (Self, impl FnMut(Packet)) {
         let socket = Arc::new(Mutex::new(socket));
         let arc_socket = socket.clone();
         let rx_callback = move |pkt: Packet| {
@@ -147,12 +122,12 @@ impl SocketCtx {
             s.on_segment(pkt.seg);
         };
 
-        (Self { socket, event }, rx_callback)
+        (Self { socket }, rx_callback)
     }
 
     pub fn consume_event(&self) {
-        let mut event = self.event.lock().unwrap();
-        let _ = event.take().expect("No event active");
+        let mut s = self.socket.lock().unwrap();
+        let _ = s.user_data.event.take().expect("No event active");
     }
 
     pub fn call_close(&self) -> Result<(), Error> {

@@ -41,15 +41,13 @@ pub struct Events<Event: Copy + Eq + core::hash::Hash + core::fmt::Debug> {
     /// Suspended user queries waiting for condition
     pub(crate) suspended: HashSet<(Event, Cookie)>,
     next_cookie: Cookie,
-    handler: Box<EventHandler>,
 }
 
 impl<Event: Copy + Eq + core::hash::Hash + core::fmt::Debug> Events<Event> {
-    pub fn new(handler: Box<EventHandler>) -> Self {
+    pub fn new() -> Self {
         Self {
             suspended: HashSet::new(),
             next_cookie: Cookie::ZERO,
-            handler,
         }
     }
 
@@ -73,15 +71,5 @@ impl<Event: Copy + Eq + core::hash::Hash + core::fmt::Debug> Events<Event> {
         log::trace!("Suspend/continue {:?} {:?}", until, cookie);
         self.suspended.insert((until, cookie));
         Err(Error::ContinueAfter(cookie))
-    }
-
-    pub(crate) fn trigger<F>(&mut self, f: F, r: Result<(), Error>)
-    where
-        F: Fn(Event) -> bool,
-    {
-        for (_, cookie) in self.suspended.drain_filter(|(wait, _)| f(*wait)) {
-            log::trace!("Triggered cookie {:?} result {:?}", cookie, r);
-            (self.handler)(cookie, r);
-        }
     }
 }

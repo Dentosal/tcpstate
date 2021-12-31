@@ -75,6 +75,7 @@ pub type PacketHandler = dyn FnMut(RemoteAddr, SegmentMeta) + Send;
 
 pub trait UserData {
     fn send(&mut self, dst: RemoteAddr, seg: SegmentMeta);
+    fn event(&mut self, cookie: Cookie, result: Result<(), Error>);
 }
 
 pub struct Socket<U: UserData> {
@@ -89,12 +90,12 @@ pub struct Socket<U: UserData> {
     timers: Timers,
     events: Events<WaitUntil>,
     pub options: SocketOptions,
-    user_data: U,
+    pub user_data: U,
 }
 
 impl<U: UserData> Socket<U> {
     /// New socket in initial state
-    pub fn new(event_handler: Box<EventHandler>, user_data: U) -> Self {
+    pub fn new(user_data: U) -> Self {
         Self {
             remote: None,
             connection_state: ConnectionState::Closed,
@@ -105,9 +106,19 @@ impl<U: UserData> Socket<U> {
             tx: TxBuffer::default(),
             timings: Timings::default(),
             timers: Timers::default(),
-            events: Events::new(event_handler),
+            events: Events::new(),
             options: SocketOptions::default(),
             user_data,
+        }
+    }
+
+    pub(crate) fn trigger_event<F>(&mut self, f: F, r: Result<(), Error>)
+    where
+        F: Fn(WaitUntil) -> bool,
+    {
+        for (_, cookie) in self.events.suspended.drain_filter(|(wait, _)| f(*wait)) {
+            log::trace!("Triggered cookie {:?} with result {:?}", cookie, r);
+            self.user_data.event(cookie, r);
         }
     }
 
@@ -141,15 +152,14 @@ impl<U: UserData> Socket<U> {
 
         // Triggers
         if self.connection_state.output_buffer_guaranteed_clear() {
-            self.events
-                .trigger(|w| w == WaitUntil::OutputBufferClear, Ok(()));
+            self.trigger_event(|w| w == WaitUntil::OutputBufferClear, Ok(()));
         }
 
         match self.connection_state {
             ConnectionState::Established {
                 tx_state, rx_state, ..
             } => {
-                self.events.trigger(|w| w == WaitUntil::Established, Ok(()));
+                self.trigger_event(|w| w == WaitUntil::Established, Ok(()));
             }
             _ => {}
         }
@@ -170,7 +180,7 @@ impl<U: UserData> Socket<U> {
         self.tx = TxBuffer::default();
         self.timings = Timings::default();
         self.timers = Timers::default();
-        self.events.trigger(|_| true, Err(Error::ConnectionClosing));
+        self.trigger_event(|_| true, Err(Error::ConnectionClosing));
     }
 
     fn reset(&mut self) {
@@ -202,7 +212,7 @@ impl<U: UserData> Socket<U> {
         log::trace!("Clearing range {}..={} from re_tx buffer", start, end);
 
         // Trigger events
-        self.events.trigger(
+        self.trigger_event(
             |w| {
                 if let WaitUntil::Acknowledged { seqn } = w {
                     // TODO: wrapping
@@ -513,8 +523,7 @@ impl<U: UserData> Socket<U> {
 
         let (tx_data, tx_fin) = self.tx.tx.read_bytes(MAX_SEGMENT_SIZE);
         if tx_data.len() == 0 {
-            self.events
-                .trigger(|w| w == WaitUntil::OutputBufferClear, Ok(()));
+            self.trigger_event(|w| w == WaitUntil::OutputBufferClear, Ok(()));
         }
 
         let len = tx_data.len();
@@ -790,7 +799,7 @@ impl<U: UserData> Socket<U> {
 
                         // Signal that data is readable for any calls waiting for that
                         let available = self.rx.available_bytes();
-                        self.events.trigger(
+                        self.trigger_event(
                             |w| {
                                 if let WaitUntil::Recv { count } = w {
                                     (count as usize) <= available
@@ -806,7 +815,7 @@ impl<U: UserData> Socket<U> {
                         self.exp_backoff = 1;
                         self.timers.re_tx = None;
 
-                        self.events.trigger(
+                        self.trigger_event(
                             |until| {
                                 if let WaitUntil::Acknowledged { seqn } = until {
                                     seqn <= seg.ackn
@@ -859,8 +868,7 @@ impl<U: UserData> Socket<U> {
                     log::trace!("Got FIN packet");
 
                     // Retry all recvs, which will not return ConnectionClosing after the buffer is empty
-                    self.events
-                        .trigger(|until| matches!(until, WaitUntil::Recv { .. }), Ok(()));
+                    self.trigger_event(|until| matches!(until, WaitUntil::Recv { .. }), Ok(()));
 
                     match self.connection_state {
                         ConnectionState::SynReceived => {
@@ -903,17 +911,17 @@ pub struct ListenSocket<U: UserData> {
     backlog: usize,
     open: bool,
     events: Events<()>,
-    user_data: U,
+    pub user_data: U,
 }
 
 impl<U: UserData> ListenSocket<U> {
     /// New socket in initial state
-    pub fn call_listen(backlog: usize, event_handler: Box<EventHandler>, user_data: U) -> Self {
+    pub fn call_listen(backlog: usize, user_data: U) -> Self {
         Self {
             queue: VecDeque::new(),
             backlog: backlog.max(1),
             open: true,
-            events: Events::new(event_handler),
+            events: Events::new(),
             user_data,
         }
     }
@@ -925,7 +933,10 @@ impl<U: UserData> ListenSocket<U> {
 
         self.open = false;
 
-        self.events.trigger(|()| true, Err(Error::ListenClosed));
+        for (_, cookie) in self.events.suspended.drain() {
+            log::trace!("Closing pending listen call {:?}", cookie);
+            self.user_data.event(cookie, Err(Error::ListenClosed));
+        }
 
         // RST all queued connections
         if !self.queue.is_empty() {
@@ -948,7 +959,6 @@ impl<U: UserData> ListenSocket<U> {
     /// Accept a new connection from the backlog
     pub fn call_accept<N: UserData, D: FnOnce() -> N>(
         &mut self,
-        event_handler: Box<EventHandler>,
         make_user_data: D,
     ) -> Result<(RemoteAddr, Socket<N>), Error> {
         log::trace!("call_accept");
@@ -959,7 +969,7 @@ impl<U: UserData> ListenSocket<U> {
 
         if let Some((addr, seg)) = self.queue.pop_front() {
             let user_data = make_user_data();
-            let mut socket = Socket::new(event_handler, user_data);
+            let mut socket = Socket::new(user_data);
             socket.remote = Some(addr);
             socket.set_state(ConnectionState::Listen);
             socket.on_segment(seg);
@@ -1020,6 +1030,12 @@ impl<U: UserData> ListenSocket<U> {
         }
 
         self.queue.push_back((addr, seg));
-        self.events.trigger(|()| true, Ok(()));
+
+        // Awake an arbitrarily selected single listener
+        if let Some((_, cookie)) = self.events.suspended.iter().next().copied() {
+            log::trace!("Awaking pending close call call {:?}", cookie);
+            self.events.suspended.remove(&((), cookie));
+            self.user_data.event(cookie, Ok(()));
+        };
     }
 }
