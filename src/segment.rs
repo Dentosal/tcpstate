@@ -30,7 +30,7 @@ impl fmt::Debug for SegmentMeta {
         let mut fs = f.debug_struct("SegmentMeta");
         fs.field("seqn", &self.seqn);
         fs.field("ackn", &self.ackn);
-        // fs.field("window", &self.window);
+        fs.field("window", &self.window);
         fs.field("flags", &self.flags);
         if self.data.is_empty() {
             fs.field("data", &[0u8; 0]);

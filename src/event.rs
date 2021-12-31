@@ -31,6 +31,12 @@ pub(crate) enum WaitUntil {
     /// Wait until unsegmentized output buffer is empty
     /// when closing
     OutputBufferClear,
+    /// Tx side of buffer is closed (FIN ACK'd)
+    TxClosed,
+    /// Rx side of buffer is closed (FIN ACK'd)
+    RxClosed,
+    /// Tboth tx and rx sides of buffer is closed (FINs ACK'd)
+    BothClosed,
     /// Wait until a receive buffer has enough data
     Recv { count: u32 },
     /// Wait until a segment is sent and acknowledged

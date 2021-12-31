@@ -31,6 +31,8 @@ impl BlobQueue {
 
     /// Takes up to `limit` bytes, and returns them and whether fin has been reached.
     pub fn read_bytes(&mut self, limit: usize) -> (Vec<u8>, bool) {
+        assert!(limit != 0);
+
         let mut result = Vec::new();
 
         while let Some(value) = self.buffer.pop_front() {

@@ -11,15 +11,18 @@ fn tcp_open_close() {
     let (server, client, mut communicate) = scenario::manual::open_pair();
 
     // Close sockets
-    client.call_close().expect("Error");
+    expect_continue!(client.call_close());
     communicate();
     assert_eq!(server.call_recv(&mut [0u8; 1]), Ok(0)); // Read EOF
     communicate();
 
-    server.call_close().expect("Error");
+    expect_continue!(server.call_close());
     communicate();
     assert_eq!(client.call_recv(&mut [0u8; 1]), Ok(0)); // Read EOF
     communicate();
+
+    client.consume_event();
+    server.consume_event();
 
     let time_after = Instant::now().add(MAX_SEGMENT_LIFETIME * 3);
     server.on_time_tick(time_after);

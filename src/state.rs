@@ -24,7 +24,7 @@ pub enum ConnectionState {
     Established {
         tx_state: ChannelState,
         rx_state: ChannelState,
-        /// Has close function been called?
+        /// User has waited for the connection to close
         close_called: bool,
     },
     /// Waiting for to make sure the other side has time to close the connections.
@@ -58,6 +58,9 @@ impl ConnectionState {
                 debug_assert!(tx_state <= to_tx_state);
                 debug_assert!(rx_state <= to_rx_state);
                 debug_assert!(close_called <= to_close_called);
+                if close_called {
+                    debug_assert!(to_tx_state >= ChannelState::Fin);
+                }
             }
         }
     }
@@ -81,6 +84,17 @@ impl ConnectionState {
             | ConnectionState::TimeWait
             | ConnectionState::Reset
             | ConnectionState::Closed => ChannelState::Closed,
+        }
+    }
+
+    pub fn close_called(self) -> bool {
+        match self {
+            ConnectionState::SynSent | ConnectionState::SynReceived => false,
+            ConnectionState::Established { close_called, .. } => close_called,
+            ConnectionState::Listen
+            | ConnectionState::TimeWait
+            | ConnectionState::Reset
+            | ConnectionState::Closed => panic!("Invalid in this context"),
         }
     }
 

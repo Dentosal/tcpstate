@@ -39,18 +39,20 @@ fn tcp_simple_happy_path() {
     assert_eq!(&buffer[..n], b"est!");
 
     // Close client socket
-    client.call_close().expect("Error");
+    expect_continue!(client.call_close());
     communicate();
     assert_eq!(server.call_recv(&mut [0u8; 1]), Ok(0)); // Read EOF
     communicate();
 
     // Close server socket
-    server.call_close().expect("Error");
+    expect_continue!(server.call_close());
     communicate();
     assert_eq!(client.call_recv(&mut [0u8; 1]), Ok(0)); // Read EOF
     communicate();
 
     // Wait until sockets are closed
+    server.consume_event();
+    client.consume_event();
 
     let time_after = Instant::now().add(MAX_SEGMENT_LIFETIME * 3);
     server.on_time_tick(time_after);

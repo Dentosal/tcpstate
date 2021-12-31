@@ -54,11 +54,15 @@ impl RxBuffer {
     /// If returns None, then the FIN is is acknowledged as well
     /// TODO: max limit, derived from sequence number space size
     pub fn read_bytes(&mut self, limit: usize) -> Vec<u8> {
+        assert!(!self.done);
         let (result, fin) = self.buffer.read_bytes(limit);
         if result.len() < limit {
             assert!(fin);
         }
         self.ackd = self.ackd.wrapping_add(result.len() as u32);
+        if fin {
+            self.ackd = self.ackd.wrapping_add(1);
+        }
         self.done = fin;
         result
     }
@@ -73,8 +77,25 @@ impl RxBuffer {
         self.ackd
     }
 
+    /// This can be returned with new packets as window field value
+    pub fn curr_window(&self) -> u16 {
+        if self.done {
+            log::trace!("DONE! w");
+            return 0;
+        }
+        log::trace!("curr w s={:?} b={:?}", self.window, self.available_bytes());
+        // FIXME: ugly/dangerous conversions
+        self.window
+            .wrapping_sub(self.available_bytes() as u16)
+            .wrapping_sub(self.buffer.fin() as u16)
+    }
+
     /// Next sequence number to be accepted for new data
     pub fn next_seqn(&self) -> u32 {
+        if self.done {
+            log::trace!("DONE! s");
+            return self.ackd;
+        }
         self.ackd
             .wrapping_add(self.available_bytes() as u32)
             .wrapping_add(self.buffer.fin() as u32)

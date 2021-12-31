@@ -1,6 +1,5 @@
 use alloc::collections::VecDeque;
 
-use crate::options::INITIAL_WINDOW_SIZE;
 use crate::queue::BlobQueue;
 use crate::{SegmentFlags, SegmentMeta};
 
@@ -20,6 +19,8 @@ pub struct TxBuffer {
     pub next: u32,
     pub window: u16,
     pub init_seqn: u32,
+    /// Last sent (seqn, ackn, window) tuple, to make sure we wont send duplicates without reason
+    pub last_sent: (u32, u32, u16),
 }
 
 impl TxBuffer {
@@ -36,6 +37,13 @@ impl TxBuffer {
         self.next < self.unack + (self.window as u32)
     }
 
+    /// Number of bytes available in unack window
+    pub fn space_available(&self) -> u32 {
+        // TODO: handle wrapping
+        let end = self.unack.wrapping_add(self.window as u32);
+        end.wrapping_sub(self.next)
+    }
+
     /// This is the ACK we are waiting for
     pub fn is_curr_ack(&self, ackn: u32) -> bool {
         self.unack == ackn
@@ -50,6 +58,8 @@ impl TxBuffer {
     pub fn on_send(&mut self, seg: SegmentMeta) {
         log::trace!("Sending {:?}", seg);
 
+        self.last_sent = (seg.seqn, seg.ackn, seg.window);
+
         self.next = self.next.wrapping_add(seg.seq_size());
 
         self.re_tx.push_back(seg);
@@ -63,8 +73,9 @@ impl Default for TxBuffer {
             re_tx: VecDeque::new(),
             unack: 0,
             next: 0,
-            window: INITIAL_WINDOW_SIZE,
+            window: 0,
             init_seqn: 0,
+            last_sent: (0, 0, 0), // TODO: None
         }
     }
 }
