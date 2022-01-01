@@ -2,8 +2,10 @@
 
 digraph A {
     node [shape=rect];
+    newrank=true;
 
-    Closed [label="Closed (initial state)"]
+    Closed [label="Closed (initial state)", group=middle]
+    Established [group=middle]
 
     Closed -> Listen [label="listen"]
     Closed -> SynSent [label="connect\n&rarr; SYN"]
@@ -16,8 +18,10 @@ digraph A {
     SynSent -> Established [label="SYN+ACK\n&rarr; ACK"]
     SynSent -> Closed [label="close", style=dotted]
 
+
     // s{0,1,2} = our FIN no/send/ack?
     // f{0,2} = their FIN no/ack?
+    // c{?} = variant with close called
     // w{?} = variant enters timewait
     //
     // s0f0 = Established
@@ -27,32 +31,64 @@ digraph A {
 
         s0f2 [label="CloseWait"]
         s1f2 [label="LastAck"]
+        s1f2c [label="LastAck (close)"]
     }
 
     subgraph cluster_ac {
 		label = < <b>Active Close</b> >;
 
-        s1f0w [label="FinWait1"]
-        s1f2w [label="Simultaneous close"]
-        s2f0w [label="FinWait2"]
-        s2f2w [label="TimeWait"]
+        s1f0w [label="FinWait1", group=1]
+        s1f0wc [label="FinWait1 (close)", group=1]
+
+        s2f0w [label="FinWait2", group=2]
+        s2f0wc [label="FinWait2 (close)", group=2]
+
+        s1f2w [label="Simultaneous close", group=3]
+        s1f2wc [label="Simultaneous close (close)", group=3]
+
+        s2f2w [label="TimeWait", group=c]
+        s2f2wc [label="TimeWait (close)", group=c]
 	}
 
-    s2f2 [label="Closed (back to start)"]
+    {
+        rank=same;
+        s2f2 [label="Wait for close call"]
+        s2f2c [label="Closed (back to start)", group=c]
+    }
+
+    {
+        // Align clusters
+        rank=same;
+        s0f2
+        s1f0w
+    }
 
     Established -> s1f0w [label="shutdown\n&rarr; FIN"]
-
-
+    Established -> s1f0wc [label="close\n&rarr; FIN"]
     Established -> s0f2 [label="FIN\n&rarr; ACK"]
 
     s1f0w -> s1f2w [label="FIN\n&rarr; ACK"]
     s2f0w -> s2f2w [label="FIN\n&rarr; ACK"]
-
     s1f2 -> s2f2 [label="ACK"]
     s1f0w -> s2f0w [label="ACK"]
     s1f2w -> s2f2w [label="ACK"]
-
     s0f2 -> s1f2 [label="shutdown\n&rarr; FIN"]
 
+    s1f0w -> s1f0wc [label="close"]
+    s1f2 -> s1f2c [label="close"]
+    s1f2w -> s1f2wc [label="close"]
+    s2f0w -> s2f0wc [label="close"]
+    s2f2 -> s2f2c [label="close"]
+    s2f2w -> s2f2wc [label="close"]
+
+    s1f0wc -> s1f2wc [label="FIN\n&rarr; ACK"]
+    s2f0wc -> s2f2wc [label="FIN\n&rarr; ACK"]
+    s1f2c -> s2f2c [label="ACK"]
+    s1f0wc -> s2f0wc [label="ACK"]
+    s1f2wc -> s2f2wc [label="ACK"]
+
     s2f2w -> s2f2 [label="timeout"]
+    s2f2wc -> s2f2c [label="timeout"]
+
+    s2f2c -> Closed [tailport=e,headport=e]
 }
