@@ -1,7 +1,7 @@
 use alloc::collections::VecDeque;
 
 use crate::queue::BlobQueue;
-use crate::{SegmentFlags, SegmentMeta};
+use crate::SegmentMeta;
 
 use crate::mock::random_seqnum;
 
@@ -25,10 +25,11 @@ pub struct TxBuffer {
 
 impl TxBuffer {
     pub fn init(&mut self) {
+        assert!(self.init_seqn == 0, "reinit"); // XXX
         self.init_seqn = random_seqnum();
         log::trace!("Init seqn={}", self.init_seqn);
         self.unack = self.init_seqn;
-        self.next = self.init_seqn.wrapping_add(1);
+        self.next = self.init_seqn;
     }
 
     /// Next index is within unack window
@@ -62,7 +63,9 @@ impl TxBuffer {
 
         self.next = self.next.wrapping_add(seg.seq_size());
 
-        self.re_tx.push_back(seg);
+        if seg.seq_size() != 0 {
+            self.re_tx.push_back(seg);
+        }
     }
 }
 

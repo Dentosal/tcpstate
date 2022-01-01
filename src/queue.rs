@@ -24,6 +24,10 @@ impl BlobQueue {
         self.fin = true;
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.available_bytes() == 0
+    }
+
     /// Takes up to `limit` bytes and ACKs them
     pub fn available_bytes(&self) -> usize {
         self.buffer.iter().map(|b| b.len()).sum()

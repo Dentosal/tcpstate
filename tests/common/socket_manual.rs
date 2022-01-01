@@ -5,17 +5,37 @@
 
 #![deny(unused_must_use)]
 
+use core::time::Duration;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 use tcpstate::{mock::*, *};
 
-use crate::sim_net::Packet;
+use crate::sim_net::{Incoming, Packet};
+
+static NOW: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ManualInstant(u64);
+impl UserTime for ManualInstant {
+    fn now() -> Self {
+        Self(NOW.fetch_add(1, Ordering::SeqCst) << 32)
+    }
+
+    fn add(&self, duration: Duration) -> Self {
+        let m = duration.as_millis();
+        assert!(m < u32::MAX as u128);
+        Self(self.0 + m as u64)
+    }
+}
 
 #[derive(Clone)]
 pub struct ManualHandler {
     pub local: RemoteAddr,
-    queue: Arc<Mutex<VecDeque<Packet>>>,
+    queue: Arc<Mutex<VecDeque<Incoming>>>,
     event: Option<Result<(), Error>>,
 }
 impl ManualHandler {
@@ -27,22 +47,30 @@ impl ManualHandler {
         }
     }
 
-    pub fn try_take(&self) -> Option<Packet> {
+    pub fn try_take(&self) -> Option<Incoming> {
         self.queue.lock().unwrap().pop_front()
     }
 }
 impl UserData for ManualHandler {
+    type Time = ManualInstant;
+
     fn send(&mut self, dst: RemoteAddr, seg: SegmentMeta) {
-        self.queue.lock().unwrap().push_back(Packet {
-            src: self.local,
-            dst,
-            seg,
-        });
+        self.queue
+            .lock()
+            .unwrap()
+            .push_back(Incoming::Packet(Packet {
+                src: self.local,
+                dst,
+                seg,
+            }));
     }
 
     fn event(&mut self, _: Cookie, result: Result<(), Error>) {
         self.event = Some(result);
     }
+
+    /// Timer ignored
+    fn add_timeout(&mut self, _: Self::Time) {}
 }
 
 pub struct ListenCtx {
@@ -155,7 +183,7 @@ impl SocketCtx {
         guard.recv_available()
     }
 
-    pub fn on_time_tick(&self, time: Instant) {
+    pub fn on_time_tick(&self, time: ManualInstant) {
         let mut guard = self.socket.lock().unwrap();
         guard.on_time_tick(time);
     }

@@ -70,12 +70,28 @@ pub fn response_to_closed(seg: SegmentMeta) -> SegmentMeta {
     }
 }
 
-pub type EventHandler = dyn FnMut(Cookie, Result<(), Error>) + Send;
-pub type PacketHandler = dyn FnMut(RemoteAddr, SegmentMeta) + Send;
-
 pub trait UserData {
+    type Time: UserTime;
+
     fn send(&mut self, dst: RemoteAddr, seg: SegmentMeta);
     fn event(&mut self, cookie: Cookie, result: Result<(), Error>);
+    fn add_timeout(&mut self, instant: Self::Time);
+}
+
+pub trait UserTime: Copy + Ord {
+    fn now() -> Self;
+    fn add(&self, duration: Duration) -> Self;
+}
+
+#[cfg(feature = "std")]
+impl UserTime for std::time::Instant {
+    fn now() -> Self {
+        std::time::Instant::now()
+    }
+
+    fn add(&self, duration: Duration) -> Self {
+        std::time::Instant::checked_add(&self, duration).unwrap()
+    }
 }
 
 pub struct Socket<U: UserData> {
@@ -87,7 +103,7 @@ pub struct Socket<U: UserData> {
     tx: TxBuffer,
     rx: RxBuffer,
     timings: Timings,
-    timers: Timers,
+    timers: Timers<U::Time>,
     events: Events<WaitUntil>,
     pub options: SocketOptions,
     pub user_data: U,
@@ -172,7 +188,7 @@ impl<U: UserData> Socket<U> {
             // TODO: detect passive close and skip timewait
             self.set_state(ConnectionState::TimeWait);
             self.timers.clear();
-            self.timers.timewait = Some(Instant::now().add(MAX_SEGMENT_LIFETIME * 2));
+            self.set_timer_timewait(MAX_SEGMENT_LIFETIME * 2);
         }
     }
 
@@ -207,7 +223,7 @@ impl<U: UserData> Socket<U> {
     /// RFC793, page 26
     fn check_segment_seq_ok(&self, seg: &SegmentMeta) -> bool {
         if self.rx.curr_window() == 0 {
-            seg.seq_size() == 0 && seg.seqn == self.rx.next_seqn()
+            seg.seq_size() == 0 && seg.seqn == self.rx.ackd
         } else {
             self.rx.in_window(seg.seqn)
                 && if seg.seq_size() == 0 {
@@ -238,15 +254,21 @@ impl<U: UserData> Socket<U> {
         // Clear queue
         loop {
             let Some(head) = self.tx.re_tx.get(0) else {
+                log::trace!("re_tx queue empty");
                 return;
             };
 
-            let start_ok = start <= head.ackn; // TODO: omit, wrap around
-            let end_ok = head.ackn + (head.data.len() as u32) <= end;
+            let start_ok = start <= head.seqn; // TODO: wrap around
+            let end_ok = head.seqn + (head.seq_size() as u32) <= end;
             if !start_ok || !end_ok {
+                log::trace!(
+                    "Not removing item from re_tx queue {:?}",
+                    (start, end, head.seqn, head.seq_size(), start_ok, end_ok)
+                );
                 return;
             }
 
+            log::trace!("Removing item from re_tx queue {:?}", head);
             let _ = self.tx.re_tx.pop_front();
         }
     }
@@ -262,16 +284,16 @@ impl<U: UserData> Socket<U> {
             self.remote = Some(remote);
             self.set_state(ConnectionState::SynSent);
             self.tx.init();
-            self.user_data.send(
-                remote,
-                SegmentMeta {
-                    seqn: self.tx.init_seqn,
-                    ackn: 0,
-                    window: self.rx.curr_window(),
-                    flags: SegmentFlags::SYN,
-                    data: Vec::new(),
-                },
-            );
+            let seg = SegmentMeta {
+                seqn: self.tx.init_seqn,
+                ackn: 0,
+                window: self.rx.curr_window(),
+                flags: SegmentFlags::SYN,
+                data: Vec::new(),
+            };
+            self.user_data.send(remote, seg.clone());
+            self.tx.on_send(seg);
+            self.set_timer_re_tx(self.timings.rto);
             self.events.return_continue_after(WaitUntil::Established)
         } else {
             Err(Error::InvalidStateTransition)
@@ -347,9 +369,6 @@ impl<U: UserData> Socket<U> {
                         let data = self.rx.read_bytes(buffer.len());
                         buffer.copy_from_slice(&data);
 
-                        // ACK the data
-                        self.send_ack();
-
                         Ok(data.len())
                     } else {
                         log::debug!("Suspending read request until enough data is available");
@@ -371,8 +390,6 @@ impl<U: UserData> Socket<U> {
                             close_called,
                         });
                     }
-
-                    self.send_ack();
 
                     Ok(data.len())
 
@@ -556,14 +573,14 @@ impl<U: UserData> Socket<U> {
 
         let seg = SegmentMeta {
             seqn: self.tx.next,
-            ackn: self.rx.curr_ackn(),
+            ackn: self.rx.ackd,
             window: self.rx.curr_window(),
             flags,
             data: tx_data,
         };
 
         if seg.seq_size() == 0 && (seg.seqn, seg.ackn, seg.window) == self.tx.last_sent {
-            log::warn!("Skipping duplicate resend");
+            log::trace!("Skipping duplicate resend");
             return;
         }
 
@@ -572,7 +589,7 @@ impl<U: UserData> Socket<U> {
             .send(self.remote.expect("No remote set"), seg);
 
         if needs_resend {
-            self.timers.re_tx = Some(Instant::now().add(self.timings.rto));
+            self.set_timer_re_tx(self.timings.rto);
         }
     }
 
@@ -584,6 +601,7 @@ impl<U: UserData> Socket<U> {
 
         match self.connection_state {
             ConnectionState::Closed | ConnectionState::Reset => {
+                log::trace!("Socket closed, replying");
                 self.user_data
                     .send(self.remote.expect("No remote set"), response_to_closed(seg));
             }
@@ -613,23 +631,23 @@ impl<U: UserData> Socket<U> {
 
                 // TODO: Store remote peer address?
                 self.rx.init(seg.seqn);
+                self.tx.init();
                 // TODO: queue data, control if any available
                 assert!(seg.data.len() == 0, "TODO");
-                let seqn = random_seqnum();
-                self.tx.next = seqn.wrapping_add(1);
-                self.tx.unack = seqn;
                 self.tx.window = seg.window;
                 self.set_state(ConnectionState::SynReceived);
-                self.user_data.send(
-                    self.remote.expect("No remote set"),
-                    SegmentMeta {
-                        seqn,
-                        ackn: self.rx.curr_ackn(),
-                        window: self.rx.curr_window(),
-                        flags: SegmentFlags::SYN | SegmentFlags::ACK,
-                        data: Vec::new(),
-                    },
-                );
+                let seg = SegmentMeta {
+                    seqn: self.tx.init_seqn,
+                    ackn: self.rx.ackd,
+                    window: self.rx.curr_window(),
+                    flags: SegmentFlags::SYN | SegmentFlags::ACK,
+                    data: Vec::new(),
+                };
+
+                self.set_timer_re_tx(self.timings.rto);
+                self.tx.on_send(seg.clone());
+                self.user_data
+                    .send(self.remote.expect("No remote set"), seg);
             }
 
             ConnectionState::SynSent => {
@@ -668,16 +686,18 @@ impl<U: UserData> Socket<U> {
                     } else {
                         todo!("If packet has data, queue it until ESTABLISHED");
                         self.set_state(ConnectionState::SynReceived);
-                        self.user_data.send(
-                            self.remote.expect("No remote set"),
-                            SegmentMeta {
-                                seqn: self.tx.init_seqn,
-                                ackn: self.rx.curr_ackn(),
-                                window: self.rx.curr_window(),
-                                flags: SegmentFlags::SYN | SegmentFlags::ACK,
-                                data: Vec::new(),
-                            },
-                        );
+                        let seg = SegmentMeta {
+                            seqn: self.tx.init_seqn,
+                            ackn: self.rx.ackd,
+                            window: self.rx.curr_window(),
+                            flags: SegmentFlags::SYN | SegmentFlags::ACK,
+                            data: Vec::new(),
+                        };
+
+                        self.set_timer_re_tx(self.timings.rto);
+                        self.tx.on_send(seg.clone());
+                        self.user_data
+                            .send(self.remote.expect("No remote set"), seg);
                     }
                 }
             }
@@ -689,7 +709,7 @@ impl<U: UserData> Socket<U> {
                             self.remote.expect("No remote set"),
                             SegmentMeta {
                                 seqn: self.tx.next,
-                                ackn: self.rx.curr_ackn(),
+                                ackn: self.rx.ackd,
                                 window: 0,
                                 flags: SegmentFlags::ACK,
                                 data: Vec::new(),
@@ -734,7 +754,7 @@ impl<U: UserData> Socket<U> {
                             self.remote.expect("No remote set"),
                             SegmentMeta {
                                 seqn: self.tx.next,
-                                ackn: self.rx.curr_ackn(),
+                                ackn: self.rx.ackd,
                                 window: self.rx.curr_window(),
                                 flags: SegmentFlags::ACK,
                                 data: Vec::new(),
@@ -791,6 +811,8 @@ impl<U: UserData> Socket<U> {
                     todo!("Return error?");
                 }
 
+                let flags = seg.flags;
+
                 if seg.flags.contains(SegmentFlags::ACK) {
                     if self.connection_state == ConnectionState::SynReceived {
                         // TODO: wrapping
@@ -800,8 +822,11 @@ impl<U: UserData> Socket<U> {
                     }
 
                     if seg.ackn < self.tx.unack || seg.ackn > self.tx.next {
-                        // log::warn!("Dropping invalid ACK");
-                        panic!("Dropping invalid ACK"); //XXX
+                        log::warn!(
+                            "Dropping invalid ACK {:?}",
+                            (self.tx.unack, seg.ackn, self.tx.next)
+                        );
+                        // panic!("Dropping invalid ACK"); //XXX
                         return;
                     }
 
@@ -838,7 +863,11 @@ impl<U: UserData> Socket<U> {
                         self.clear_re_tx_range(self.tx.unack, seg.ackn);
                         self.tx.unack = seg.ackn;
                         self.exp_backoff = 1;
-                        self.timers.re_tx = None;
+                        if self.tx.re_tx.is_empty() {
+                            self.timers.re_tx = None;
+                        } else {
+                            self.set_timer_re_tx(self.timings.rto);
+                        }
 
                         self.trigger_event(
                             |until| {
@@ -851,6 +880,7 @@ impl<U: UserData> Socket<U> {
                             Ok(()),
                         );
                     }
+
                     if let ConnectionState::Established {
                         rx_state,
                         tx_state,
@@ -858,8 +888,10 @@ impl<U: UserData> Socket<U> {
                     } = self.connection_state
                     {
                         if tx_state == ChannelState::Fin {
-                            if seg.ackn == self.tx.unack {
+                            if seg.ackn == self.tx.next {
                                 log::trace!("ACK for our FIN received");
+                                debug_assert!(self.tx.tx.is_empty());
+                                debug_assert!(self.tx.re_tx.is_empty());
                                 self.set_state(ConnectionState::Established {
                                     tx_state: ChannelState::Closed,
                                     rx_state,
@@ -870,15 +902,26 @@ impl<U: UserData> Socket<U> {
                     }
 
                     // Store segment data
-                    if seg.seqn == self.rx.next_seqn() {
-                        self.rx.write_bytes(seg.data);
-                        if seg.flags.contains(SegmentFlags::FIN) {
-                            self.rx.mark_network_fin();
-                        }
-                    } else if seg.seqn < self.rx.next_seqn() {
-                        log::trace!("Past data, discard");
+                    if seg.seqn == self.rx.ackd {
+                        self.rx.write(seg);
+                        self.send_ack();
+                    } else if seg.seqn < self.rx.ackd {
+                        // log::trace!("Past data, discard");
+                        log::trace!("Past data, re-ack and discard");
+                        let seg = SegmentMeta {
+                            seqn: self.tx.next,
+                            ackn: self.rx.ackd,
+                            window: self.rx.curr_window(),
+                            flags: SegmentFlags::ACK,
+                            data: Vec::new(),
+                        };
+                        self.user_data
+                            .send(self.remote.expect("No remote set"), seg);
+                        return;
                     } else {
-                        todo!("Out-of-order data");
+                        log::trace!("out-of-order {:?} != {:?}", seg.seqn, self.rx.ackd);
+                        // TODO: cache out-of-order data for later
+                        return;
                     }
                 }
 
@@ -889,7 +932,7 @@ impl<U: UserData> Socket<U> {
                     return;
                 }
 
-                if seg.flags.contains(SegmentFlags::FIN) {
+                if flags.contains(SegmentFlags::FIN) {
                     log::trace!("Got FIN packet");
 
                     // Retry all recvs, which will not return ConnectionClosing after the buffer is empty

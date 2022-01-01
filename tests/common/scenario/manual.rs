@@ -1,6 +1,9 @@
 use tcpstate::*;
 
-use crate::socket_manual::{ListenCtx, ManualHandler, SocketCtx};
+use crate::{
+    common::sim_net::Incoming,
+    socket_manual::{ListenCtx, ManualHandler, SocketCtx},
+};
 
 pub fn open_pair() -> (SocketCtx, SocketCtx, impl FnMut()) {
     let server_handler = ManualHandler::new();
@@ -20,16 +23,30 @@ pub fn open_pair() -> (SocketCtx, SocketCtx, impl FnMut()) {
         let mut any_events = true;
         while any_events {
             any_events = false;
-            while let Some(p) = server_h.try_take() {
-                c_on_segment(p);
+            while let Some(inc) = server_h.try_take() {
+                match inc {
+                    Incoming::Packet(p) => {
+                        c_on_segment(p);
+                    }
+                    Incoming::Timeout(_) => {
+                        todo!("Timeout")
+                    }
+                }
                 any_events = true;
                 count += 1;
                 if count > LIMIT {
                     panic!("Limit reached");
                 }
             }
-            while let Some(p) = client_h.try_take() {
-                s_on_segment(p);
+            while let Some(inc) = client_h.try_take() {
+                match inc {
+                    Incoming::Packet(p) => {
+                        s_on_segment(p);
+                    }
+                    Incoming::Timeout(_) => {
+                        todo!("Timeout")
+                    }
+                }
                 any_events = true;
                 count += 1;
                 if count > LIMIT {

@@ -1,7 +1,8 @@
-use tcpstate::{mock::*, options::*, *};
+use tcpstate::{options::*, *};
 
 #[macro_use]
 mod common;
+use common::socket_manual::ManualInstant;
 use common::*;
 
 /// One sided FIN, like with HTTP/1.0 requests
@@ -72,7 +73,7 @@ fn tcp_one_sided() {
     client.call_close().expect("close failed");
     communicate();
 
-    let time_after = Instant::now().add(MAX_SEGMENT_LIFETIME * 3);
+    let time_after = ManualInstant::now().add(MAX_SEGMENT_LIFETIME * 3);
     server.on_time_tick(time_after);
     client.on_time_tick(time_after);
 

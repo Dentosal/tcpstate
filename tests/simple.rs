@@ -1,9 +1,8 @@
-use tcpstate::{mock::*, options::*, *};
+use tcpstate::*;
 
 #[macro_use]
 mod common;
 use common::*;
-
 #[test]
 fn tcp_simple_happy_path() {
     init();
@@ -38,13 +37,10 @@ fn tcp_simple_happy_path() {
     let n = server.call_recv(&mut buffer[..avail]).expect("Error");
     assert_eq!(&buffer[..n], b"est!");
 
-    // Close client socket
+    // Close sockets
     expect_continue!(client.call_close());
     communicate();
     assert_eq!(server.call_recv(&mut [0u8; 1]), Ok(0)); // Read EOF
-    communicate();
-
-    // Close server socket
     expect_continue!(server.call_close());
     communicate();
     assert_eq!(client.call_recv(&mut [0u8; 1]), Ok(0)); // Read EOF
@@ -54,10 +50,6 @@ fn tcp_simple_happy_path() {
     server.consume_event();
     client.consume_event();
 
-    let time_after = Instant::now().add(MAX_SEGMENT_LIFETIME * 3);
-    server.on_time_tick(time_after);
-    client.on_time_tick(time_after);
-
-    assert_eq!(ConnectionState::Closed, client.state(), "client");
-    assert_eq!(ConnectionState::Closed, server.state(), "server");
+    // assert_eq!(ConnectionState::TimeWait, client.state(), "client");
+    // assert_eq!(ConnectionState::Closed, server.state(), "server");
 }

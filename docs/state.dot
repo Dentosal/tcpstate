@@ -17,7 +17,7 @@ digraph A {
     SynSent -> Closed [label="close", style=dotted]
 
     // s{0,1,2} = our FIN no/send/ack?
-    // f{0,1,2} = their FIN no/send/ack?
+    // f{0,2} = their FIN no/ack?
     // w{?} = variant enters timewait
     //
     // s0f0 = Established
@@ -25,24 +25,17 @@ digraph A {
 	subgraph cluster_pc {
 		label = < <b>Passive Close</b> >;
 
-        s0f1 [label="No-more-RX"]
-        s0f2 [label="TX-only"]
-        s1f2 [label="TX-only-buffer"]
-        pLastRead [shape=diamond, label="Has user read FIN?"]
+        s0f2 [label="CloseWait"]
+        s1f2 [label="LastAck"]
     }
 
     subgraph cluster_ac {
 		label = < <b>Active Close</b> >;
 
         s1f0w [label="FinWait1"]
-        s1f1w [label="Mutual FinWait1"]
-        s1f2w [label="TX-only-buffer"]
-        s2f0w [label="RX-only"]
-        s2f1w [label="RX-only-buffer"]
+        s1f2w [label="Simultaneous close"]
+        s2f0w [label="FinWait2"]
         s2f2w [label="TimeWait"]
-
-        aLastRead1 [shape=diamond, label="Has user read FIN?"]
-        aLastRead2 [shape=diamond, label="Has user read FIN?"]
 	}
 
     s2f2 [label="Closed (back to start)"]
@@ -50,28 +43,15 @@ digraph A {
     Established -> s1f0w [label="shutdown\n&rarr; FIN"]
 
 
-    Established -> pLastRead [label="FIN"]
-    pLastRead -> s0f1 [label="no"]
-    pLastRead -> s0f2 [label="yes\n&rarr; ACK"]
+    Established -> s0f2 [label="FIN\n&rarr; ACK"]
 
-    s1f0w -> aLastRead1 [label="FIN"]
-    aLastRead1 -> s1f1w [label="no"]
-    aLastRead1 -> s1f2w [label="yes\n&rarr; ACK"]
-
-    s2f0w -> aLastRead2 [label="FIN"]
-    aLastRead2 -> s2f1w [label="no"]
-    aLastRead2 -> s2f2w [label="yes\n&rarr; ACK"]
-
-    s0f1 -> s0f2 [label="User reads FIN\n&rarr; ACK"]
-    s1f1w -> s1f2w [label="User reads FIN\n&rarr; ACK"]
-    s2f1w -> s2f2w [label="User reads FIN\n&rarr; ACK"]
+    s1f0w -> s1f2w [label="FIN\n&rarr; ACK"]
+    s2f0w -> s2f2w [label="FIN\n&rarr; ACK"]
 
     s1f2 -> s2f2 [label="ACK"]
     s1f0w -> s2f0w [label="ACK"]
-    s1f1w -> s2f1w [label="ACK"]
     s1f2w -> s2f2w [label="ACK"]
 
-    s0f1 -> s1f1w [label="shutdown\n&rarr; FIN"]
     s0f2 -> s1f2 [label="shutdown\n&rarr; FIN"]
 
     s2f2w -> s2f2 [label="timeout"]

@@ -4,18 +4,17 @@
 use alloc::vec::Vec;
 
 use crate::options::INITIAL_WINDOW_SIZE;
+use crate::{SegmentFlags, SegmentMeta};
 
 use crate::queue::BlobQueue;
 
 #[derive(Debug, Clone)]
 pub struct RxBuffer {
-    /// All data in the buffer is always user-readable
-    /// and acknowledged whenever it is read
+    /// ACK'd user-readable data
     buffer: BlobQueue,
-    /// If user has read the FIN byte
+    /// Last ACK'd sequnce number
+    pub ackd: u32,
     done: bool,
-    /// Last ACK'd sequnce number, e.g. first item before the buffer
-    ackd: u32,
     /// Window size
     window: u16,
     /// Initial sequence number
@@ -39,10 +38,9 @@ impl RxBuffer {
         self.window
     }
 
-    pub fn mark_network_fin(&mut self) {
-        debug_assert!(!self.buffer.fin(), "Duplicate FIN marking");
-        log::trace!("Network FIN");
-        self.buffer.mark_fin();
+    /// Buffer empty, and will not have any more data
+    pub fn is_done(&self) -> bool {
+        self.done
     }
 
     /// Takes up to `limit` bytes and ACKs them
@@ -59,27 +57,24 @@ impl RxBuffer {
         if result.len() < limit {
             assert!(fin);
         }
-        self.ackd = self.ackd.wrapping_add(result.len() as u32);
-        if fin {
-            self.ackd = self.ackd.wrapping_add(1);
-        }
         self.done = fin;
         result
     }
 
     /// Bytes from the network are written using this
-    pub fn write_bytes(&mut self, data: Vec<u8>) {
-        self.buffer.write_bytes(data);
-    }
-
-    /// This can be returned with new packets as ACK field value
-    pub fn curr_ackn(&self) -> u32 {
-        self.ackd
+    pub fn write(&mut self, seg: SegmentMeta) {
+        self.ackd = self.ackd.wrapping_add(seg.seq_size() as u32);
+        if seg.flags.contains(SegmentFlags::FIN) {
+            debug_assert!(!self.buffer.fin(), "Duplicate FIN marking");
+            log::trace!("Network FIN");
+            self.buffer.mark_fin();
+        }
+        self.buffer.write_bytes(seg.data);
     }
 
     /// This can be returned with new packets as window field value
     pub fn curr_window(&self) -> u16 {
-        if self.done {
+        if self.buffer.fin() {
             log::trace!("DONE! w");
             return 0;
         }
@@ -89,25 +84,14 @@ impl RxBuffer {
             .wrapping_sub(self.available_bytes() as u16)
             .wrapping_sub(self.buffer.fin() as u16)
     }
-
-    /// Next sequence number to be accepted for new data
-    pub fn next_seqn(&self) -> u32 {
-        if self.done {
-            log::trace!("DONE! s");
-            return self.ackd;
-        }
-        self.ackd
-            .wrapping_add(self.available_bytes() as u32)
-            .wrapping_add(self.buffer.fin() as u32)
-    }
 }
 
 impl Default for RxBuffer {
     fn default() -> Self {
         Self {
             buffer: BlobQueue::new(),
-            done: false,
             ackd: 0,
+            done: false,
             window: INITIAL_WINDOW_SIZE,
             init_seqn: 0,
         }

@@ -2,13 +2,14 @@
 pub enum ChannelState {
     /// Data is allowed to flow through
     Open,
-    /// End of data on this channel has been reached,
-    /// indicated by a FIN packet.
-    /// On sending side, FIN is queued for sending when the buffer is empty and no more data will be accepted.
-    /// On receiving side, no more data will be arriving but the buffer may still contain some data.
+    /// End of data on this channel has been reached, indicated by a FIN packet.
+    ///
+    /// On sending side, FIN is queued for sending and no more data will be accepted.
+    ///
+    /// On receiving side, FIN has been ACK and no more data will be arriving,
+    /// but the buffer may still contain some data.
     Fin,
-    /// FIN has been read by the user and ACK'd.
-    /// No more data remains in the buffer.
+    /// FIN has been ACK'd. No more data remains in the buffer.
     Closed,
 }
 

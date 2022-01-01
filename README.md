@@ -7,11 +7,9 @@ This libary supports `#[no_std]` as long as a global alloctor is available (`all
 ### Not yet implemented
 
 * [critical] Sequence number wrap-around
-* [critical] Lost packet retransmission
 * [critical] Some state transitions
 * Proper sequence number clock
 * User timeouts
-* Proper timers
 * Buffer size limits
 * Packet fragmenting
 * Proper window scaling

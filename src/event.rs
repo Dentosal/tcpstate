@@ -1,7 +1,6 @@
-use alloc::boxed::Box;
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashSet;
 
-use crate::{result::Error, EventHandler};
+use crate::result::Error;
 
 //// MOCK /////////////////
 use core::sync::atomic::{AtomicU64, Ordering};
