@@ -44,7 +44,7 @@ impl ListenCtx {
                         }
                     }
                     Incoming::Timeout(now) => {
-                        let mut s = arc_socket.lock().unwrap();
+                        // let mut s = arc_socket.lock().unwrap();
                         // s.on_timeout(now);
                         for (_, item) in m.iter() {
                             item.send(Incoming::Timeout(now)).unwrap();

@@ -25,8 +25,8 @@ fn tcp_open_close() {
     client.consume_event();
     server.consume_event();
 
-    // assert_eq!(ConnectionState::TimeWait, client.state(), "client");
-    // assert_eq!(ConnectionState::Closed, server.state(), "server");
+    assert_eq!(ConnectionState::TimeWait, client.state(), "client");
+    assert_eq!(ConnectionState::Closed, server.state(), "server");
 
     let time_after = ManualInstant::now().add(MAX_SEGMENT_LIFETIME * 3);
     server.on_time_tick(time_after);

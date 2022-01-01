@@ -50,6 +50,6 @@ fn tcp_simple_happy_path() {
     server.consume_event();
     client.consume_event();
 
-    // assert_eq!(ConnectionState::TimeWait, client.state(), "client");
-    // assert_eq!(ConnectionState::Closed, server.state(), "server");
+    assert_eq!(ConnectionState::TimeWait, client.state(), "client");
+    assert_eq!(ConnectionState::Closed, server.state(), "server");
 }

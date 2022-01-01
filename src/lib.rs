@@ -30,6 +30,7 @@ mod segment;
 mod state;
 mod timers;
 mod tx;
+mod user_data;
 
 use crate::mock::*;
 
@@ -45,6 +46,7 @@ pub use result::Error;
 pub use rtt::Timings;
 pub use segment::{SegmentFlags, SegmentMeta};
 pub use state::ConnectionState;
+pub use user_data::{UserData, UserTime};
 
 use crate::state::ChannelState;
 
@@ -67,30 +69,6 @@ pub fn response_to_closed(seg: SegmentMeta) -> SegmentMeta {
             flags: SegmentFlags::RST,
             data: Vec::new(),
         }
-    }
-}
-
-pub trait UserData {
-    type Time: UserTime;
-
-    fn send(&mut self, dst: RemoteAddr, seg: SegmentMeta);
-    fn event(&mut self, cookie: Cookie, result: Result<(), Error>);
-    fn add_timeout(&mut self, instant: Self::Time);
-}
-
-pub trait UserTime: Copy + Ord {
-    fn now() -> Self;
-    fn add(&self, duration: Duration) -> Self;
-}
-
-#[cfg(feature = "std")]
-impl UserTime for std::time::Instant {
-    fn now() -> Self {
-        std::time::Instant::now()
-    }
-
-    fn add(&self, duration: Duration) -> Self {
-        std::time::Instant::checked_add(&self, duration).unwrap()
     }
 }
 
@@ -178,17 +156,21 @@ impl<U: UserData> Socket<U> {
         }
 
         // Reduce state
-        if self.connection_state
-            == (ConnectionState::Established {
-                tx_state: ChannelState::Closed,
-                rx_state: ChannelState::Closed,
-                close_called: true,
-            })
+        if let ConnectionState::Established {
+            tx_state: ChannelState::Closed,
+            rx_state: ChannelState::Closed,
+            close_called: true,
+            close_active,
+        } = self.connection_state
         {
-            // TODO: detect passive close and skip timewait
-            self.set_state(ConnectionState::TimeWait);
-            self.timers.clear();
-            self.set_timer_timewait(MAX_SEGMENT_LIFETIME * 2);
+            if close_active {
+                // TODO: detect passive close and skip timewait
+                self.set_state(ConnectionState::TimeWait);
+                self.timers.clear();
+                self.set_timer_timewait(MAX_SEGMENT_LIFETIME * 2);
+            } else {
+                self.clear();
+            }
         }
     }
 
@@ -361,6 +343,7 @@ impl<U: UserData> Socket<U> {
                 rx_state,
                 tx_state,
                 close_called,
+                close_active,
             } => match rx_state {
                 ChannelState::Closed => Ok(0),
                 ChannelState::Open => {
@@ -388,6 +371,7 @@ impl<U: UserData> Socket<U> {
                             tx_state,
                             rx_state: ChannelState::Closed,
                             close_called,
+                            close_active,
                         });
                     }
 
@@ -419,9 +403,22 @@ impl<U: UserData> Socket<U> {
                 todo!("queue if any new/queued sends");
                 todo!("send fin");
             }
-            ConnectionState::Established { tx_state, .. } => match tx_state {
+            ConnectionState::Established {
+                tx_state,
+                rx_state,
+                close_called,
+                ..
+            } => match tx_state {
                 ChannelState::Closed | ChannelState::Fin => Err(Error::ConnectionClosing),
                 ChannelState::Open => {
+                    if rx_state == ChannelState::Open {
+                        self.set_state(ConnectionState::Established {
+                            tx_state,
+                            rx_state,
+                            close_called,
+                            close_active: true,
+                        })
+                    }
                     self.tx.tx.mark_fin();
                     self.send_ack();
                     Ok(())
@@ -459,7 +456,16 @@ impl<U: UserData> Socket<U> {
                     Ok(())
                 }
             }
-            ConnectionState::Established { tx_state, .. } => {
+            ConnectionState::Established {
+                tx_state,
+                rx_state,
+                mut close_active,
+                ..
+            } => {
+                if rx_state == ChannelState::Open {
+                    close_active = true;
+                }
+
                 if tx_state == ChannelState::Open {
                     self.tx.tx.mark_fin();
                     self.send_ack();
@@ -472,6 +478,7 @@ impl<U: UserData> Socket<U> {
                     tx_state,
                     rx_state,
                     close_called: true,
+                    close_active,
                 });
 
                 match tx_state {
@@ -563,6 +570,7 @@ impl<U: UserData> Socket<U> {
                 tx_state: ChannelState::Fin,
                 rx_state: self.connection_state.rx(),
                 close_called: self.connection_state.close_called(),
+                close_active: self.connection_state.close_active(),
             });
             SegmentFlags::FIN | SegmentFlags::ACK
         } else {
@@ -885,6 +893,7 @@ impl<U: UserData> Socket<U> {
                         rx_state,
                         tx_state,
                         close_called,
+                        close_active,
                     } = self.connection_state
                     {
                         if tx_state == ChannelState::Fin {
@@ -896,6 +905,7 @@ impl<U: UserData> Socket<U> {
                                     tx_state: ChannelState::Closed,
                                     rx_state,
                                     close_called,
+                                    close_active,
                                 });
                             }
                         }
@@ -944,12 +954,14 @@ impl<U: UserData> Socket<U> {
                                 tx_state: ChannelState::Open,
                                 rx_state: ChannelState::Fin,
                                 close_called: false,
+                                close_active: false,
                             });
                         }
                         ConnectionState::Established {
                             tx_state,
                             rx_state,
                             close_called,
+                            close_active,
                         } => {
                             self.set_state(ConnectionState::Established {
                                 tx_state,
@@ -961,6 +973,7 @@ impl<U: UserData> Socket<U> {
                                     }
                                 },
                                 close_called,
+                                close_active,
                             });
                         }
                         ConnectionState::TimeWait => {

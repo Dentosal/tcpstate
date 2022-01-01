@@ -27,6 +27,8 @@ pub enum ConnectionState {
         rx_state: ChannelState,
         /// User has waited for the connection to close
         close_called: bool,
+        /// We called close before receiving FIN, so we must enter TimeWait before closing
+        close_active: bool,
     },
     /// Waiting for to make sure the other side has time to close the connections.
     TimeWait,
@@ -40,6 +42,7 @@ impl ConnectionState {
         tx_state: ChannelState::Open,
         rx_state: ChannelState::Open,
         close_called: false,
+        close_active: false,
     };
 
     /// Check for some invalid transitions
@@ -48,17 +51,20 @@ impl ConnectionState {
             tx_state,
             rx_state,
             close_called,
+            close_active,
         } = self
         {
             if let ConnectionState::Established {
                 tx_state: to_tx_state,
                 rx_state: to_rx_state,
                 close_called: to_close_called,
+                close_active: to_close_active,
             } = to
             {
                 debug_assert!(tx_state <= to_tx_state);
                 debug_assert!(rx_state <= to_rx_state);
                 debug_assert!(close_called <= to_close_called);
+                debug_assert!(close_active <= to_close_active);
                 if close_called {
                     debug_assert!(to_tx_state >= ChannelState::Fin);
                 }
@@ -96,6 +102,17 @@ impl ConnectionState {
             | ConnectionState::TimeWait
             | ConnectionState::Reset
             | ConnectionState::Closed => panic!("Invalid in this context"),
+        }
+    }
+
+    pub fn close_active(self) -> bool {
+        match self {
+            ConnectionState::SynSent | ConnectionState::SynReceived => false,
+            ConnectionState::Established { close_active, .. } => close_active,
+            ConnectionState::TimeWait => true,
+            ConnectionState::Listen | ConnectionState::Reset | ConnectionState::Closed => {
+                panic!("Invalid in this context")
+            }
         }
     }
 
