@@ -53,13 +53,12 @@ impl<U: UserData> Socket<U> {
             | ConnectionState::SynSent
             | ConnectionState::SynReceived
             | ConnectionState::Established { .. } => {
-                // TODO: recalc RTO?
-                // TODO: backoff
                 if let Some(seg) = self.tx.re_tx.front() {
                     log::trace!("Resending {:?}", seg);
+                    self.exp_backoff *= 2;
                     self.user_data
                         .send(self.remote.expect("No remote set"), seg.clone());
-                    self.set_timer_re_tx(self.timings.rto);
+                    self.set_timer_re_tx(self.timings.rto + Duration::new(self.exp_backoff, 0));
                 }
             }
             ConnectionState::Reset => {}

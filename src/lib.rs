@@ -74,7 +74,7 @@ pub struct Socket<U: UserData> {
     connection_state: ConnectionState,
     dup_ack_count: u8,
     congestation_window: u16,
-    exp_backoff: u16,
+    exp_backoff: u64,
     tx: TxBuffer,
     rx: RxBuffer,
     timings: Timings,
@@ -161,7 +161,6 @@ impl<U: UserData> Socket<U> {
         } = self.connection_state
         {
             if close_active {
-                // TODO: detect passive close and skip timewait
                 self.set_state(ConnectionState::TimeWait);
                 self.timers.clear();
                 self.set_timer_timewait(MAX_SEGMENT_LIFETIME * 2);
@@ -199,7 +198,7 @@ impl<U: UserData> Socket<U> {
         self.connection_state = ConnectionState::Reset;
     }
 
-    /// RFC793, page 26
+    /// RFC793, page 26 and 68
     fn check_segment_seq_ok(&self, seg: &SegmentMeta) -> bool {
         if self.rx.curr_window() == 0 {
             seg.seq_size() == 0 && seg.seqn == self.rx.ackd
@@ -371,8 +370,6 @@ impl<U: UserData> Socket<U> {
                     }
 
                     Ok(data.len())
-
-                    // TODO: Signal ConnectionClosing when FIN has been reached?
                 }
             },
         }
@@ -579,8 +576,6 @@ impl<U: UserData> Socket<U> {
 
     /// Sends an ack packet, including any data form buffer if possible.
     fn send_ack(&mut self) {
-        // TODO: check window size before sending any payload
-
         let limit = MAX_SEGMENT_SIZE.min(self.tx.space_available() as usize);
 
         let (tx_data, tx_fin) = if limit == 0 {
@@ -676,7 +671,10 @@ impl<U: UserData> Socket<U> {
                     return;
                 }
 
-                // TODO: Store remote peer address?
+                assert!(
+                    self.remote.is_some(),
+                    "Listener should have stored remote address"
+                );
                 self.rx.init(seg.seqn);
                 self.tx.init(SeqN::new(self.user_data.new_seqn()));
                 // TODO: queue data, control if any available
@@ -737,8 +735,6 @@ impl<U: UserData> Socket<U> {
             ConnectionState::TimeWait
             | ConnectionState::SynReceived
             | ConnectionState::Established { .. } => {
-                // Acceptability check (RFC 793 page 36 and 68)
-                // TODO: process valid ACKs and RSTs even if receive_window == 0?
                 if !self.check_segment_seq_ok(&seg) {
                     log::trace!("Non-acceptable segment {:#?}", seg);
                     if !seg.flags.contains(SegmentFlags::RST) {
@@ -828,8 +824,7 @@ impl<U: UserData> Socket<U> {
                         } else if self.congestation_window <= SLOW_START_TRESHOLD {
                             self.congestation_window *= 2;
                         } else {
-                            // TODO: cast better
-                            self.congestation_window += seg.data.len() as u16;
+                            self.congestation_window += seg.data.len() as u16; // TODO: checked conversion
                         }
 
                         // End of window update

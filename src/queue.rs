@@ -1,5 +1,4 @@
-//! TODO: buffer size limit
-//! TODO: buffers larger then 2GiB??
+//! TODO: size limit
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;

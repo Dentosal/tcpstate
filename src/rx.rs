@@ -1,6 +1,3 @@
-//! TODO: buffer size limit
-//! TODO: buffers larger then 2GiB??
-
 use alloc::vec::Vec;
 
 use crate::options::INITIAL_WINDOW_SIZE;
@@ -52,7 +49,6 @@ impl RxBuffer {
 
     /// Takes up to `limit` bytes (if any) and ACKs them
     /// If returns None, then the FIN is is acknowledged as well
-    /// TODO: max limit, derived from sequence number space size
     pub fn read_bytes(&mut self, limit: usize) -> Vec<u8> {
         assert!(!self.done);
         let (result, fin) = self.buffer.read_bytes(limit);
@@ -77,14 +73,18 @@ impl RxBuffer {
     /// This can be returned with new packets as window field value
     pub fn curr_window(&self) -> u16 {
         if self.buffer.fin() {
-            log::trace!("DONE! w");
             return 0;
         }
-        log::trace!("curr w s={:?} b={:?}", self.window, self.available_bytes());
-        // FIXME: ugly/dangerous conversions
-        self.window
-            .wrapping_sub(self.available_bytes() as u16)
-            .wrapping_sub(self.buffer.fin() as u16)
+
+        let av = self
+            .available_bytes()
+            .wrapping_sub(self.buffer.fin() as usize);
+
+        if av >= self.window as usize {
+            0
+        } else {
+            self.window - (av as u16)
+        }
     }
 }
 
