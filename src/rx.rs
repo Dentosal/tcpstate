@@ -4,7 +4,7 @@
 use alloc::vec::Vec;
 
 use crate::options::INITIAL_WINDOW_SIZE;
-use crate::{SegmentFlags, SegmentMeta};
+use crate::{SegmentFlags, SegmentMeta, SeqN};
 
 use crate::queue::BlobQueue;
 
@@ -13,25 +13,27 @@ pub struct RxBuffer {
     /// ACK'd user-readable data
     buffer: BlobQueue,
     /// Last ACK'd sequnce number
-    pub ackd: u32,
+    pub ackd: SeqN,
     done: bool,
     /// Window size
     window: u16,
     /// Initial sequence number
-    init_seqn: u32,
+    init_seqn: SeqN,
 }
 impl RxBuffer {
     /// Called when in Listen state and a new SYN packet arrives,
     /// or when in SynSent state and a new SYN-ACK packet arrives
-    pub fn init(&mut self, seqn: u32) {
+    pub fn init(&mut self, seqn: SeqN) {
         log::trace!("Init seqn={}", seqn);
         self.init_seqn = seqn;
         self.ackd = seqn.wrapping_add(1); // +1 because SYN
     }
 
-    pub fn in_window(&self, seqn: u32) -> bool {
-        // TODO: handle wrapping
-        self.ackd <= seqn && seqn < (self.ackd + (self.window as u32))
+    pub fn in_window(&self, seqn: SeqN) -> bool {
+        seqn.in_range_inclusive(
+            self.ackd,
+            self.ackd.wrapping_add(self.window as u32).wrapping_sub(1),
+        )
     }
 
     pub fn window_size(&self) -> u16 {
@@ -90,10 +92,10 @@ impl Default for RxBuffer {
     fn default() -> Self {
         Self {
             buffer: BlobQueue::new(),
-            ackd: 0,
+            ackd: SeqN::ZERO,
             done: false,
             window: INITIAL_WINDOW_SIZE,
-            init_seqn: 0,
+            init_seqn: SeqN::ZERO,
         }
     }
 }

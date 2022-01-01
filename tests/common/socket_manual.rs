@@ -37,6 +37,7 @@ pub struct ManualHandler {
     pub local: RemoteAddr,
     queue: Arc<Mutex<VecDeque<Incoming>>>,
     event: Option<Result<(), Error>>,
+    pub next_seqn: u32,
 }
 impl ManualHandler {
     pub fn new() -> Self {
@@ -44,6 +45,7 @@ impl ManualHandler {
             local: RemoteAddr::new(),
             queue: Arc::new(Mutex::new(VecDeque::new())),
             event: None,
+            next_seqn: 10_000,
         }
     }
 
@@ -53,6 +55,12 @@ impl ManualHandler {
 }
 impl UserData for ManualHandler {
     type Time = ManualInstant;
+
+    fn new_seqn(&mut self) -> u32 {
+        let result = self.next_seqn;
+        self.next_seqn = self.next_seqn.wrapping_add(10_000);
+        result
+    }
 
     fn send(&mut self, dst: RemoteAddr, seg: SegmentMeta) {
         self.queue

@@ -1,15 +1,12 @@
 use hashbrown::HashSet;
 
 use crate::result::Error;
-
-//// MOCK /////////////////
-use core::sync::atomic::{AtomicU64, Ordering};
-static SEQ: AtomicU64 = AtomicU64::new(5);
-
-//////////////////////////
+use crate::SeqN;
 
 /// Blocking operation returns an event cookie.
-/// The request should be repeated whenever the cookie is [word].
+/// The operation can block in either continue or retry mode,
+/// and the corresponding action should be taken whn the cookie
+/// is sent through `user_data.event()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cookie(u64);
 
@@ -17,9 +14,7 @@ impl Cookie {
     pub(crate) const ZERO: Self = Cookie(0);
 
     pub(crate) fn next(self) -> Cookie {
-        // Self(self.0 + 1)
-        // XXX: for debugging separate cookies per process
-        Self(SEQ.fetch_add(1, Ordering::SeqCst))
+        Self(self.0 + 1)
     }
 }
 
@@ -38,7 +33,7 @@ pub(crate) enum WaitUntil {
     /// Wait until a receive buffer has enough data
     Recv { count: u32 },
     /// Wait until a segment is sent and acknowledged
-    Acknowledged { seqn: u32 },
+    Acknowledged { seqn: SeqN },
 }
 
 pub struct Events<Event: Copy + Eq + core::hash::Hash + core::fmt::Debug> {
@@ -56,11 +51,9 @@ impl<Event: Copy + Eq + core::hash::Hash + core::fmt::Debug> Events<Event> {
     }
 
     pub(crate) fn new_cookie(&mut self) -> Cookie {
-        // let result = self.next_cookie;
-        // self.next_cookie = self.next_cookie.next();
-        // result
+        let result = self.next_cookie;
         self.next_cookie = self.next_cookie.next();
-        self.next_cookie
+        result
     }
 
     pub(crate) fn return_retry_after<T>(&mut self, until: Event) -> Result<T, Error> {

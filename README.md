@@ -6,11 +6,14 @@ This libary supports `#[no_std]` as long as a global alloctor is available (`all
 
 ### Not yet implemented
 
-* [critical] Sequence number wrap-around
-* Proper sequence number clock
+* Proper documentation for...
+    * The pluggable `user_data` handler
+        * Sequence number clock
+    * Anything else
 * User timeouts
+* Persist timer
 * Buffer size limits
-* Packet fragmenting
+* Accept new connections in TimeWait state as per RFC 1122 page 88
 * Proper window scaling
 * Nagle's Algorithm
 * Congestion control and fast retransmit

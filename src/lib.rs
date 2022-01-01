@@ -6,9 +6,6 @@
 #![deny(unused_must_use)]
 #![forbid(unsafe_code)]
 
-//! TODO: persist timer
-//! TODO: Accept new connection in TimeWait state as per RFC 1122 page 88
-
 extern crate alloc;
 
 use core::time::Duration;
@@ -42,7 +39,7 @@ pub use event::Cookie;
 pub use options::SocketOptions;
 pub use result::Error;
 pub use rtt::Timings;
-pub use segment::{SegmentFlags, SegmentMeta};
+pub use segment::{SegmentFlags, SegmentMeta, SeqN};
 pub use state::ConnectionState;
 pub use user_data::{UserData, UserTime};
 
@@ -55,8 +52,8 @@ pub fn response_to_closed(seg: SegmentMeta) -> Option<SegmentMeta> {
         None
     } else if seg.flags.contains(SegmentFlags::ACK) {
         Some(SegmentMeta {
-            seqn: 0,
-            ackn: seg.seqn.wrapping_add(seg.data.len() as u32),
+            seqn: SeqN::ZERO,
+            ackn: seg.seqn.wrapping_add(seg.data.len().try_into().unwrap()),
             window: 0,
             flags: SegmentFlags::RST | SegmentFlags::ACK,
             data: Vec::new(),
@@ -64,7 +61,7 @@ pub fn response_to_closed(seg: SegmentMeta) -> Option<SegmentMeta> {
     } else {
         Some(SegmentMeta {
             seqn: seg.ackn,
-            ackn: 0,
+            ackn: SeqN::ZERO,
             window: 0,
             flags: SegmentFlags::RST,
             data: Vec::new(),
@@ -211,21 +208,21 @@ impl<U: UserData> Socket<U> {
                 && if seg.seq_size() == 0 {
                     true
                 } else {
-                    self.rx.in_window(seg.seqn + (seg.seq_size() as u32) - 1)
+                    self.rx
+                        .in_window(seg.seqn.wrapping_add(seg.seq_size() as u32).wrapping_sub(1))
                 }
         }
     }
 
     /// Remove ACK'd segments from re_tx queue
-    fn clear_re_tx_range(&mut self, start: u32, end: u32) {
-        log::trace!("Clearing range {}..={} from re_tx buffer", start, end);
+    fn clear_re_tx_range(&mut self, end: SeqN) {
+        log::trace!("Clearing re_tx buffer until {}", end);
 
         // Trigger events
         self.trigger_event(
             |w| {
                 if let WaitUntil::Acknowledged { seqn } = w {
-                    // TODO: wrapping
-                    start <= seqn && seqn <= end
+                    seqn.lte(end)
                 } else {
                     false
                 }
@@ -240,12 +237,10 @@ impl<U: UserData> Socket<U> {
                 return;
             };
 
-            let start_ok = start <= head.seqn; // TODO: wrap around
-            let end_ok = head.seqn + (head.seq_size() as u32) <= end;
-            if !start_ok || !end_ok {
+            if !head.seqn_after().lte(end) {
                 log::trace!(
                     "Not removing item from re_tx queue {:?}",
-                    (start, end, head.seqn, head.seq_size(), start_ok, end_ok)
+                    (end, head.seqn_after())
                 );
                 return;
             }
@@ -265,10 +260,10 @@ impl<U: UserData> Socket<U> {
         ) {
             self.remote = Some(remote);
             self.set_state(ConnectionState::SynSent);
-            self.tx.init();
+            self.tx.init(SeqN::new(self.user_data.new_seqn()));
             let seg = SegmentMeta {
                 seqn: self.tx.init_seqn,
-                ackn: 0,
+                ackn: SeqN::ZERO,
                 window: self.rx.curr_window(),
                 flags: SegmentFlags::SYN,
                 data: Vec::new(),
@@ -565,7 +560,7 @@ impl<U: UserData> Socket<U> {
                     self.remote.expect("No remote set"),
                     SegmentMeta {
                         seqn: self.tx.next,
-                        ackn: 0,
+                        ackn: SeqN::ZERO,
                         window: self.rx.curr_window(),
                         flags: SegmentFlags::RST,
                         data: Vec::new(),
@@ -629,7 +624,7 @@ impl<U: UserData> Socket<U> {
             data: tx_data,
         };
 
-        if seg.seq_size() == 0 && (seg.seqn, seg.ackn, seg.window) == self.tx.last_sent {
+        if seg.seq_size() == 0 && Some((seg.seqn, seg.ackn, seg.window)) == self.tx.last_sent {
             log::trace!("Skipping duplicate resend");
             return;
         }
@@ -667,7 +662,7 @@ impl<U: UserData> Socket<U> {
                         self.remote.expect("No remote set"),
                         SegmentMeta {
                             seqn: seg.ackn,
-                            ackn: 0,
+                            ackn: SeqN::ZERO,
                             window: 0,
                             flags: SegmentFlags::RST,
                             data: Vec::new(),
@@ -683,7 +678,7 @@ impl<U: UserData> Socket<U> {
 
                 // TODO: Store remote peer address?
                 self.rx.init(seg.seqn);
-                self.tx.init();
+                self.tx.init(SeqN::new(self.user_data.new_seqn()));
                 // TODO: queue data, control if any available
                 assert!(seg.data.len() == 0, "TODO");
                 self.tx.window = seg.window;
@@ -704,14 +699,12 @@ impl<U: UserData> Socket<U> {
 
             ConnectionState::SynSent => {
                 if seg.flags.contains(SegmentFlags::ACK) {
-                    if (seg.ackn <= self.tx.init_seqn || seg.ackn > self.tx.next)
-                        && !(seg.ackn <= self.tx.unack && seg.ackn <= self.tx.next)
-                    {
+                    if !seg.ackn.in_range_inclusive(self.tx.unack, self.tx.next) {
                         self.user_data.send(
                             self.remote.expect("No remote set"),
                             SegmentMeta {
                                 seqn: seg.ackn,
-                                ackn: 0,
+                                ackn: SeqN::ZERO,
                                 window: self.rx.curr_window(),
                                 flags: SegmentFlags::RST,
                                 data: Vec::new(),
@@ -728,7 +721,7 @@ impl<U: UserData> Socket<U> {
 
                 if seg.flags.contains(SegmentFlags::SYN | SegmentFlags::ACK) {
                     self.rx.init(seg.seqn);
-                    self.clear_re_tx_range(self.tx.unack, seg.ackn);
+                    self.clear_re_tx_range(seg.ackn);
                     self.tx.unack = seg.ackn;
                     self.tx.window = seg.window;
                     if self.tx.unack == self.tx.init_seqn.wrapping_add(1) {
@@ -791,7 +784,7 @@ impl<U: UserData> Socket<U> {
                         self.remote.expect("No remote set"),
                         SegmentMeta {
                             seqn: self.tx.next,
-                            ackn: 0,
+                            ackn: SeqN::ZERO,
                             window: self.rx.curr_window(),
                             flags: SegmentFlags::RST,
                             data: Vec::new(),
@@ -812,24 +805,22 @@ impl<U: UserData> Socket<U> {
 
                 if seg.flags.contains(SegmentFlags::ACK) {
                     if self.connection_state == ConnectionState::SynReceived {
-                        // TODO: wrapping
-                        if self.tx.unack <= seg.ackn && seg.ackn <= self.tx.next {
+                        if seg.ackn.in_range_inclusive(self.tx.unack, self.tx.next) {
                             self.set_state(ConnectionState::FULLY_OPEN);
                         }
                     }
 
-                    if seg.ackn < self.tx.unack || seg.ackn > self.tx.next {
+                    let ack_valid = seg.ackn.in_range_inclusive(self.tx.unack, self.tx.next);
+                    if !ack_valid {
                         log::warn!(
                             "Dropping invalid ACK {:?}",
                             (self.tx.unack, seg.ackn, self.tx.next)
                         );
-                        // panic!("Dropping invalid ACK"); //XXX
                         return;
                     }
 
                     if self.tx.unack != seg.ackn {
                         // New valid ACK
-                        debug_assert!(self.tx.unack < seg.ackn && seg.ackn <= self.tx.next);
 
                         // Window update subroutine
                         if self.dup_ack_count > 0 {
@@ -857,7 +848,7 @@ impl<U: UserData> Socket<U> {
                             Ok(()),
                         );
 
-                        self.clear_re_tx_range(self.tx.unack, seg.ackn);
+                        self.clear_re_tx_range(seg.ackn);
                         self.tx.unack = seg.ackn;
                         self.exp_backoff = 1;
                         if self.tx.re_tx.is_empty() {
@@ -869,7 +860,7 @@ impl<U: UserData> Socket<U> {
                         self.trigger_event(
                             |until| {
                                 if let WaitUntil::Acknowledged { seqn } = until {
-                                    seqn <= seg.ackn
+                                    seqn.lte(seg.ackn)
                                 } else {
                                     false
                                 }
@@ -904,8 +895,7 @@ impl<U: UserData> Socket<U> {
                     if seg.seqn == self.rx.ackd {
                         self.rx.write(seg);
                         self.send_ack();
-                    } else if seg.seqn < self.rx.ackd {
-                        // log::trace!("Past data, discard");
+                    } else if seg.seqn.lt(self.rx.ackd) {
                         log::trace!("Past data, re-ack and discard");
                         let seg = SegmentMeta {
                             seqn: self.tx.next,
@@ -1023,7 +1013,7 @@ impl<U: UserData> ListenSocket<U> {
                 addr,
                 SegmentMeta {
                     seqn: seg.ackn,
-                    ackn: 0,
+                    ackn: SeqN::ZERO,
                     window: 0,
                     flags: SegmentFlags::RST,
                     data: Vec::new(),
@@ -1074,7 +1064,7 @@ impl<U: UserData> ListenSocket<U> {
                 addr,
                 SegmentMeta {
                     seqn: seg.ackn,
-                    ackn: 0,
+                    ackn: SeqN::ZERO,
                     window: 0,
                     flags: SegmentFlags::RST,
                     data: Vec::new(),
@@ -1096,7 +1086,7 @@ impl<U: UserData> ListenSocket<U> {
                 addr,
                 SegmentMeta {
                     seqn: seg.ackn.wrapping_add(1),
-                    ackn: 0,
+                    ackn: SeqN::ZERO,
                     window: 0,
                     flags: SegmentFlags::ACK | SegmentFlags::RST,
                     data: Vec::new(),

@@ -6,6 +6,7 @@ use crate::{Cookie, Error, SegmentMeta};
 pub trait UserData {
     type Time: UserTime;
 
+    fn new_seqn(&mut self) -> u32;
     fn send(&mut self, dst: RemoteAddr, seg: SegmentMeta);
     fn event(&mut self, cookie: Cookie, result: Result<(), Error>);
     fn add_timeout(&mut self, instant: Self::Time);

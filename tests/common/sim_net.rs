@@ -1,6 +1,7 @@
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::sync::atomic::AtomicU32;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, RwLock,
@@ -46,6 +47,8 @@ impl<T> Event<T> {
     }
 }
 
+pub static INIT_SEQN: AtomicU32 = AtomicU32::new(0);
+
 #[derive(Clone)]
 pub struct HostHandler {
     local: RemoteAddr,
@@ -55,6 +58,10 @@ pub struct HostHandler {
 
 impl tcpstate::UserData for HostHandler {
     type Time = Instant;
+
+    fn new_seqn(&mut self) -> u32 {
+        INIT_SEQN.load(Ordering::SeqCst)
+    }
 
     fn send(&mut self, dst: RemoteAddr, seg: SegmentMeta) {
         let network = self.network.read().unwrap();
