@@ -1,7 +1,7 @@
 use core::time::Duration;
 
 use crate::state::ConnectionState;
-use crate::{Socket, UserData, UserTime};
+use crate::{Error, Socket, UserData, UserTime};
 
 /// Timings per https://datatracker.ietf.org/doc/html/rfc6298
 #[derive(Debug, Clone)]
@@ -77,7 +77,7 @@ impl<U: UserData> Socket<U> {
 
     pub(crate) fn on_timer_usertime(&mut self) {
         log::trace!("on_timer_usertime");
-        todo!("Signal error to all outstanding calls");
+        self.trigger_event(|_| true, Err(Error::TimedOut));
         self.clear();
     }
 

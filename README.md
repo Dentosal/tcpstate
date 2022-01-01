@@ -7,7 +7,6 @@ This libary supports `#[no_std]` as long as a global alloctor is available (`all
 ### Not yet implemented
 
 * [critical] Sequence number wrap-around
-* [critical] Some state transitions
 * Proper sequence number clock
 * User timeouts
 * Buffer size limits

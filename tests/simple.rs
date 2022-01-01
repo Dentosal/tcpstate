@@ -47,8 +47,8 @@ fn tcp_simple_happy_path() {
     communicate();
 
     // Wait until sockets are closed
-    server.consume_event();
-    client.consume_event();
+    server.consume_event().expect("Error: event");
+    client.consume_event().expect("Error: event");
 
     assert_eq!(ConnectionState::TimeWait, client.state(), "client");
     assert_eq!(ConnectionState::Closed, server.state(), "server");

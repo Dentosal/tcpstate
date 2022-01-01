@@ -10,11 +10,13 @@ use std::time::Instant;
 
 use tcpstate::{mock::RemoteAddr, Cookie, Error, SegmentMeta};
 
+#[derive(Debug)]
 pub enum Incoming {
     Packet(Packet),
     Timeout(Instant),
 }
 
+#[derive(Debug)]
 pub struct Packet {
     pub src: RemoteAddr,
     pub dst: RemoteAddr,

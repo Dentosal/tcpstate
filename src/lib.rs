@@ -6,8 +6,6 @@
 #![deny(unused_must_use)]
 #![forbid(unsafe_code)]
 
-//! TODO: don't clear_range for SYN,FIN
-//! TODO: re_tx FIN
 //! TODO: persist timer
 //! TODO: Accept new connection in TimeWait state as per RFC 1122 page 88
 
@@ -52,23 +50,25 @@ use crate::state::ChannelState;
 
 /// Response to a packet when the socket is closed
 /// RFC 793 page 64
-pub fn response_to_closed(seg: SegmentMeta) -> SegmentMeta {
-    if seg.flags.contains(SegmentFlags::ACK) {
-        SegmentMeta {
+pub fn response_to_closed(seg: SegmentMeta) -> Option<SegmentMeta> {
+    if seg.flags.contains(SegmentFlags::RST) {
+        None
+    } else if seg.flags.contains(SegmentFlags::ACK) {
+        Some(SegmentMeta {
             seqn: 0,
             ackn: seg.seqn.wrapping_add(seg.data.len() as u32),
             window: 0,
             flags: SegmentFlags::RST | SegmentFlags::ACK,
             data: Vec::new(),
-        }
+        })
     } else {
-        SegmentMeta {
+        Some(SegmentMeta {
             seqn: seg.ackn,
             ackn: 0,
             window: 0,
             flags: SegmentFlags::RST,
             data: Vec::new(),
-        }
+        })
     }
 }
 
@@ -133,7 +133,7 @@ impl<U: UserData> Socket<U> {
 
         // Triggers
         if self.connection_state.output_buffer_guaranteed_clear() {
-            self.trigger_event(|w| w == WaitUntil::OutputBufferClear, Ok(()));
+            self.trigger_event(|w| w == WaitUntil::TxQueueEmpty, Ok(()));
         }
 
         match self.connection_state {
@@ -392,16 +392,32 @@ impl<U: UserData> Socket<U> {
             ConnectionState::Closed => Err(Error::NotConnected),
             ConnectionState::TimeWait => Err(Error::ConnectionClosing),
             ConnectionState::Listen | ConnectionState::SynSent => {
-                let has_queued_recvs = todo!("RECV queue");
-                if has_queued_recvs {
-                    todo!("Send ConnectionClosing to the RECVs");
-                }
+                self.trigger_event(|_| true, Err(Error::ConnectionClosing));
                 self.clear();
                 Ok(())
             }
             ConnectionState::SynReceived => {
-                todo!("queue if any new/queued sends");
-                todo!("send fin");
+                if self
+                    .events
+                    .any_suspended(|w| matches!(w, WaitUntil::Acknowledged { .. }))
+                {
+                    // Cannot send FIN yet, as some call_send are queued
+                    // TODO: we could continue when the buffer has data but no calls are queued
+                    log::trace!("Delaying shutdown until no more senders");
+                    return self.events.return_retry_after(WaitUntil::TxQueueEmpty);
+                }
+
+                self.tx.tx.mark_fin();
+                self.send_ack();
+
+                self.set_state(ConnectionState::Established {
+                    tx_state: ChannelState::Fin,
+                    rx_state: ChannelState::Open,
+                    close_called: false,
+                    close_active: true,
+                });
+
+                Ok(())
             }
             ConnectionState::Established {
                 tx_state,
@@ -411,6 +427,17 @@ impl<U: UserData> Socket<U> {
             } => match tx_state {
                 ChannelState::Closed | ChannelState::Fin => Err(Error::ConnectionClosing),
                 ChannelState::Open => {
+                    if self.tx.tx.available_bytes() != 0
+                        || self
+                            .events
+                            .any_suspended(|w| matches!(w, WaitUntil::Acknowledged { .. }))
+                    {
+                        // Cannot send FIN yet, as some call_send are queued
+                        // TODO: we could continue when the buffer has data but no calls are queued
+                        log::trace!("Delaying shutdown until no more senders");
+                        return self.events.return_retry_after(WaitUntil::TxQueueEmpty);
+                    }
+
                     if rx_state == ChannelState::Open {
                         self.set_state(ConnectionState::Established {
                             tx_state,
@@ -436,25 +463,35 @@ impl<U: UserData> Socket<U> {
             ConnectionState::Closed => Err(Error::NotConnected),
             ConnectionState::TimeWait => Err(Error::ConnectionClosing),
             ConnectionState::Listen | ConnectionState::SynSent => {
-                let has_queued_recvs = todo!("RECV queue");
-                if has_queued_recvs {
-                    todo!("Send ConnectionClosing to the RECVs");
-                }
+                self.trigger_event(
+                    |w| matches!(w, WaitUntil::Recv { .. }),
+                    Err(Error::ConnectionClosing),
+                );
                 self.clear();
                 Ok(())
             }
             ConnectionState::SynReceived => {
-                let new_sends = todo!("New sends");
-                let queued_sends = todo!("Queued sends");
-                if new_sends || queued_sends {
+                if self.tx.tx.available_bytes() != 0
+                    || self
+                        .events
+                        .any_suspended(|w| matches!(w, WaitUntil::Acknowledged { .. }))
+                {
                     // Cannot close socket yet, as some items are queued
-                    todo!("Queue sends");
-                } else {
-                    self.tx.tx.mark_fin();
-                    self.send_ack();
-
-                    Ok(())
+                    log::trace!("Delaying close until no more senders");
+                    return self.events.return_retry_after(WaitUntil::TxQueueEmpty);
                 }
+
+                self.tx.tx.mark_fin();
+                self.send_ack();
+
+                self.set_state(ConnectionState::Established {
+                    tx_state: ChannelState::Fin,
+                    rx_state: ChannelState::Open,
+                    close_called: true,
+                    close_active: true,
+                });
+
+                self.events.return_continue_after(WaitUntil::BothClosed)
             }
             ConnectionState::Established {
                 tx_state,
@@ -467,6 +504,16 @@ impl<U: UserData> Socket<U> {
                 }
 
                 if tx_state == ChannelState::Open {
+                    if self.tx.tx.available_bytes() != 0
+                        || self
+                            .events
+                            .any_suspended(|w| matches!(w, WaitUntil::Acknowledged { .. }))
+                    {
+                        // Cannot close socket yet, as some items are queued
+                        log::trace!("Delaying close until no more senders");
+                        return self.events.return_retry_after(WaitUntil::TxQueueEmpty);
+                    }
+
                     self.tx.tx.mark_fin();
                     self.send_ack();
                 }
@@ -490,7 +537,7 @@ impl<U: UserData> Socket<U> {
 
                 match rx_state {
                     ChannelState::Open | ChannelState::Fin => {
-                        return self.events.return_continue_after(WaitUntil::BothClosed)
+                        return self.events.return_continue_after(WaitUntil::BothClosed);
                     }
                     ChannelState::Closed => {}
                 }
@@ -509,10 +556,7 @@ impl<U: UserData> Socket<U> {
             ConnectionState::Reset => Err(Error::ConnectionReset),
             ConnectionState::Closed => Err(Error::NotConnected),
             ConnectionState::Listen | ConnectionState::SynSent => {
-                let has_queued_recvs = todo!("RECV queue");
-                if has_queued_recvs {
-                    todo!("Send ConnectionReset to the RECVs");
-                }
+                self.trigger_event(|_| true, Err(Error::ConnectionReset));
                 self.clear();
                 Ok(())
             }
@@ -527,16 +571,9 @@ impl<U: UserData> Socket<U> {
                         data: Vec::new(),
                     },
                 );
-                let mut r = Ok(());
-
-                let queued_sends = todo!("Queued sends");
-                let queued_recvs = todo!("Queued recvs");
-                if queued_sends || queued_recvs {
-                    r = Err(Error::ConnectionReset);
-                }
-
+                self.trigger_event(|_| true, Err(Error::ConnectionReset));
                 self.clear();
-                r
+                Ok(())
             }
             ConnectionState::TimeWait => {
                 self.clear();
@@ -556,7 +593,12 @@ impl<U: UserData> Socket<U> {
         } else {
             let (tx_data, tx_fin) = self.tx.tx.read_bytes(limit);
             if tx_data.len() == 0 {
-                self.trigger_event(|w| w == WaitUntil::OutputBufferClear, Ok(()));
+                if !self
+                    .events
+                    .any_suspended(|w| matches!(w, WaitUntil::Acknowledged { .. }))
+                {
+                    self.trigger_event(|w| w == WaitUntil::TxQueueEmpty, Ok(()));
+                }
             }
             (tx_data, tx_fin)
         };
@@ -610,8 +652,10 @@ impl<U: UserData> Socket<U> {
         match self.connection_state {
             ConnectionState::Closed | ConnectionState::Reset => {
                 log::trace!("Socket closed, replying");
-                self.user_data
-                    .send(self.remote.expect("No remote set"), response_to_closed(seg));
+                if let Some(resp) = response_to_closed(seg) {
+                    self.user_data
+                        .send(self.remote.expect("No remote set"), resp);
+                }
             }
             ConnectionState::Listen => {
                 if seg.flags.contains(SegmentFlags::RST) {
@@ -682,77 +726,24 @@ impl<U: UserData> Socket<U> {
                     return;
                 }
 
-                if seg.flags.contains(SegmentFlags::SYN) {
+                if seg.flags.contains(SegmentFlags::SYN | SegmentFlags::ACK) {
                     self.rx.init(seg.seqn);
                     self.clear_re_tx_range(self.tx.unack, seg.ackn);
                     self.tx.unack = seg.ackn;
                     self.tx.window = seg.window;
-                    if self.tx.unack > self.tx.init_seqn {
-                        // Our SYN has been ACK'd
+                    if self.tx.unack == self.tx.init_seqn.wrapping_add(1) {
+                        log::trace!("Our SYN has been SYN-ACK'd");
                         self.set_state(ConnectionState::FULLY_OPEN);
                         self.send_ack();
                     } else {
-                        todo!("If packet has data, queue it until ESTABLISHED");
-                        self.set_state(ConnectionState::SynReceived);
-                        let seg = SegmentMeta {
-                            seqn: self.tx.init_seqn,
-                            ackn: self.rx.ackd,
-                            window: self.rx.curr_window(),
-                            flags: SegmentFlags::SYN | SegmentFlags::ACK,
-                            data: Vec::new(),
-                        };
-
-                        self.set_timer_re_tx(self.timings.rto);
-                        self.tx.on_send(seg.clone());
-                        self.user_data
-                            .send(self.remote.expect("No remote set"), seg);
+                        // TODO: cache out-of-order data packets
+                        log::trace!("Invalid SYN-ACK sequence number");
                     }
                 }
             }
-            ConnectionState::TimeWait => {
-                if !self.check_segment_seq_ok(&seg) {
-                    log::trace!("RST!!");
-                    if !seg.flags.contains(SegmentFlags::RST) {
-                        self.user_data.send(
-                            self.remote.expect("No remote set"),
-                            SegmentMeta {
-                                seqn: self.tx.next,
-                                ackn: self.rx.ackd,
-                                window: 0,
-                                flags: SegmentFlags::ACK,
-                                data: Vec::new(),
-                            },
-                        );
-                    }
-                } else if seg.flags.contains(SegmentFlags::RST) {
-                    self.clear();
-                } else if !seg.flags.contains(SegmentFlags::SYN) {
-                    if seg.flags.contains(SegmentFlags::ACK)
-                        && seg.flags.contains(SegmentFlags::FIN)
-                        && self.tx.is_non_ordered_ack(seg.ackn)
-                    {
-                        todo!("FIN bit processing");
-                        self.timers.clear();
-                        todo!("set timewait 2MSL");
-                    }
-                } else {
-                    self.user_data.send(
-                        self.remote.expect("No remote set"),
-                        SegmentMeta {
-                            seqn: self.tx.next,
-                            ackn: 0,
-                            window: 0,
-                            flags: SegmentFlags::RST,
-                            data: Vec::new(),
-                        },
-                    );
-
-                    todo!("Signal connection reset to pending reads/writes");
-
-                    self.clear();
-                }
-            }
-            ConnectionState::SynReceived | ConnectionState::Established { .. } => {
+            ConnectionState::TimeWait
+            | ConnectionState::SynReceived
+            | ConnectionState::Established { .. } => {
                 // Acceptability check (RFC 793 page 36 and 68)
                 // TODO: process valid ACKs and RSTs even if receive_window == 0?
                 if !self.check_segment_seq_ok(&seg) {
@@ -772,27 +763,18 @@ impl<U: UserData> Socket<U> {
                     return;
                 }
 
-                self.tx.window = seg.window;
-
-                // self.tx.window = seg.window.min(self.congestation_window);
-
-                // if self.connection_state != ConnectionState::SynSent
-                //     && seg.flags.contains(SegmentFlags::RST)
-                // {
-                //     todo!("RFC 793 page 36 Reset processing");
-                // }
+                self.tx.window = seg.window.min(self.congestation_window);
 
                 if seg.flags.contains(SegmentFlags::RST) {
                     match self.connection_state {
                         ConnectionState::SynReceived => {
-                            todo!("If actively connecting, error ConnectionRefused");
                             self.clear();
                             self.set_state(ConnectionState::Listen);
                         }
                         ConnectionState::Established { .. } => {
-                            todo!("Pending RECV/SEND calls: signal error ConnectionReset");
+                            self.trigger_event(|_| true, Err(Error::ConnectionReset));
                             self.clear();
-                            todo!("Return error?");
+                            self.set_state(ConnectionState::Reset);
                         }
                         _ => unreachable!(),
                     }
@@ -802,7 +784,7 @@ impl<U: UserData> Socket<U> {
                 if seg.flags.contains(SegmentFlags::SYN) {
                     log::warn!("Peer error: SYN");
 
-                    todo!("Pending RECV/SEND calls: signal error ConnectionReset");
+                    self.trigger_event(|_| true, Err(Error::ConnectionReset));
 
                     // Error! Send reset, flush all queues
                     self.user_data.send(
@@ -816,10 +798,17 @@ impl<U: UserData> Socket<U> {
                         },
                     );
 
-                    todo!("Return error?");
+                    self.clear();
+                    self.set_state(ConnectionState::Reset);
+                    return;
                 }
 
                 let flags = seg.flags;
+                let is_non_ordered_ack = if seg.flags.contains(SegmentFlags::ACK) {
+                    self.tx.is_non_ordered_ack(seg.ackn)
+                } else {
+                    false
+                };
 
                 if seg.flags.contains(SegmentFlags::ACK) {
                     if self.connection_state == ConnectionState::SynReceived {
@@ -945,8 +934,17 @@ impl<U: UserData> Socket<U> {
                 if flags.contains(SegmentFlags::FIN) {
                     log::trace!("Got FIN packet");
 
-                    // Retry all recvs, which will not return ConnectionClosing after the buffer is empty
-                    self.trigger_event(|until| matches!(until, WaitUntil::Recv { .. }), Ok(()));
+                    if self.connection_state == ConnectionState::TimeWait {
+                        if is_non_ordered_ack {
+                            log::trace!("Got FIN packet");
+                            self.trigger_event(|_| true, Err(Error::ConnectionClosing));
+                            self.timers.clear();
+                            self.set_timer_timewait(MAX_SEGMENT_LIFETIME * 2);
+                        }
+                    } else {
+                        // Retry all recvs, which will not return ConnectionClosing after the buffer is empty
+                        self.trigger_event(|until| matches!(until, WaitUntil::Recv { .. }), Ok(()));
+                    }
 
                     match self.connection_state {
                         ConnectionState::SynReceived => {
@@ -975,9 +973,6 @@ impl<U: UserData> Socket<U> {
                                 close_called,
                                 close_active,
                             });
-                        }
-                        ConnectionState::TimeWait => {
-                            todo!("Restart 2MSL time-wait timeout");
                         }
                         _ => {}
                     }

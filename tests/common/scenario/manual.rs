@@ -66,7 +66,7 @@ pub fn open_pair() -> (SocketCtx, SocketCtx, impl FnMut()) {
 
     communicate();
 
-    listen.consume_event();
+    listen.consume_event().expect("Error: event");
 
     let (_, server) = listen.accept().expect("Accept");
     {
@@ -76,7 +76,7 @@ pub fn open_pair() -> (SocketCtx, SocketCtx, impl FnMut()) {
 
     communicate();
 
-    client.consume_event();
+    client.consume_event().expect("Error: event");
 
     assert_eq!(ConnectionState::FULLY_OPEN, client.state(), "client");
     assert_eq!(ConnectionState::FULLY_OPEN, server.state(), "server");

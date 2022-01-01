@@ -111,9 +111,9 @@ impl ListenCtx {
         )
     }
 
-    pub fn consume_event(&self) {
+    pub fn consume_event(&self) -> Result<(), Error> {
         let mut s = self.socket.lock().unwrap();
-        let _ = s.user_data.event.take().expect("No event active");
+        s.user_data.event.take().expect("No event active")
     }
 
     pub fn call<T, F: FnMut(&mut ListenSocket<ManualHandler>) -> Result<T, Error>>(
@@ -153,14 +153,19 @@ impl SocketCtx {
         (Self { socket }, rx_callback)
     }
 
-    pub fn consume_event(&self) {
+    pub fn consume_event(&self) -> Result<(), Error> {
         let mut s = self.socket.lock().unwrap();
-        let _ = s.user_data.event.take().expect("No event active");
+        s.user_data.event.take().expect("No event active")
     }
 
     pub fn call_close(&self) -> Result<(), Error> {
         let mut guard = self.socket.lock().unwrap();
         guard.call_close()
+    }
+
+    pub fn call_abort(&self) -> Result<(), Error> {
+        let mut guard = self.socket.lock().unwrap();
+        guard.call_abort()
     }
 
     pub fn call_shutdown(&self) -> Result<(), Error> {

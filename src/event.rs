@@ -27,9 +27,8 @@ impl Cookie {
 pub(crate) enum WaitUntil {
     /// Wait until connection has been established
     Established,
-    /// Wait until unsegmentized output buffer is empty
-    /// when closing
-    OutputBufferClear,
+    /// No data in tx buffer and no queued tx calls
+    TxQueueEmpty,
     /// Tx side of buffer is closed (FIN ACK'd)
     TxClosed,
     /// Rx side of buffer is closed (FIN ACK'd)
@@ -76,5 +75,12 @@ impl<Event: Copy + Eq + core::hash::Hash + core::fmt::Debug> Events<Event> {
         log::trace!("Suspend/continue {:?} {:?}", until, cookie);
         self.suspended.insert((until, cookie));
         Err(Error::ContinueAfter(cookie))
+    }
+
+    pub(crate) fn any_suspended<F>(&mut self, f: F) -> bool
+    where
+        F: Fn(Event) -> bool,
+    {
+        self.suspended.iter().any(|(e, _)| f(*e))
     }
 }
