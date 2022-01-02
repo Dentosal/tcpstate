@@ -8,6 +8,7 @@ use crate::SeqN;
 /// and the corresponding action should be taken whn the cookie
 /// is sent through `user_data.event()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cookie(u64);
 
 impl Cookie {

@@ -4,13 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
-std = []
+default = ["serde"]
+std = ["serde"]
 
 [dependencies]
 bitflags = "1.2"
 log = "0.4"
 hashbrown = "0.11"
+
+[dependencies.serde]
+version = "1.0"
+default-features = false
+features = ["alloc", "derive"]
+optional = true
 
 [dev-dependencies]
 # Tests
