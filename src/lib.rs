@@ -150,18 +150,6 @@ impl<U: UserData> Socket<U> {
         }
     }
 
-    pub fn call_listen(&mut self, backlog: usize) -> Result<(), Error> {
-        if self.state() != ConnectionState::Closed {
-            return Err(Error::InvalidStateTransition);
-        }
-
-        // Do some swapping so that we don't need Copy property for UserData
-        let inner = core::mem::replace(&mut self.inner, SocketInner::SwapTemp);
-        let SocketCommon { user_data, .. } = inner.extract_common();
-        self.inner = SocketInner::Listen(ListenSocket::call_listen(backlog, user_data));
-        Ok(())
-    }
-
     pub fn call_connect(&mut self, remote: U::Addr) -> Result<(), Error> {
         if self.state() != ConnectionState::Closed {
             return Err(Error::InvalidStateTransition);
@@ -176,6 +164,30 @@ impl<U: UserData> Socket<U> {
         let result = c.call_connect(remote);
         self.inner = SocketInner::Connection(c);
         result
+    }
+
+    pub fn call_listen(&mut self, backlog: usize) -> Result<(), Error> {
+        if self.state() != ConnectionState::Closed {
+            return Err(Error::InvalidStateTransition);
+        }
+
+        // Do some swapping so that we don't need Copy property for UserData
+        let inner = core::mem::replace(&mut self.inner, SocketInner::SwapTemp);
+        let SocketCommon { user_data, .. } = inner.extract_common();
+        self.inner = SocketInner::Listen(ListenSocket::call_listen(backlog, user_data));
+        Ok(())
+    }
+
+    pub fn call_accept<D: FnOnce() -> U>(
+        &mut self,
+        make_user_data: D,
+    ) -> Result<(U::Addr, Connection<U>), Error> {
+        match &mut self.inner {
+            SocketInner::SwapTemp => unreachable!(),
+            SocketInner::Closed(_) => Err(Error::Closed),
+            SocketInner::Connection(_) => Err(Error::InvalidStateTransition),
+            SocketInner::Listen(s) => s.call_accept(make_user_data),
+        }
     }
 
     pub fn call_close(&mut self) -> Result<(), Error> {
