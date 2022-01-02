@@ -15,7 +15,7 @@ where
         let (_, accepted) = listen.accept().expect("Accept");
         accepted
             .call(|socket| {
-                socket.options.nagle_delay = core::time::Duration::ZERO;
+                socket.options_mut().nagle_delay = core::time::Duration::ZERO;
                 Ok(())
             })
             .unwrap();
@@ -28,7 +28,7 @@ where
         let client = SocketCtx::new(host_handler, rx);
         client
             .call(|socket| {
-                socket.options.nagle_delay = core::time::Duration::ZERO;
+                socket.options_mut().nagle_delay = core::time::Duration::ZERO;
                 socket.call_connect(server_addr)
             })
             .expect("Connect");
@@ -66,7 +66,7 @@ pub fn echo_server() -> (sim_net::Network, sim_net::RemoteAddr, Sender<()>) {
                 println!("New connection from {:?}", addr);
                 accepted
                     .call(|socket| {
-                        socket.options.nagle_delay = core::time::Duration::ZERO;
+                        socket.options_mut().nagle_delay = core::time::Duration::ZERO;
                         Ok(())
                     })
                     .unwrap();

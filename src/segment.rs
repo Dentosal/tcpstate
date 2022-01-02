@@ -92,10 +92,12 @@ impl SeqN {
         self.0
     }
 
+    #[must_use]
     pub fn wrapping_add(self, v: u32) -> Self {
         Self(self.0.wrapping_add(v))
     }
 
+    #[must_use]
     pub fn wrapping_sub(self, v: u32) -> Self {
         Self(self.0.wrapping_sub(v))
     }

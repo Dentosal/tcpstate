@@ -1,7 +1,7 @@
 use core::time::Duration;
 
 use crate::state::ConnectionState;
-use crate::{Error, Socket, UserData, UserTime};
+use crate::{Connection, Error, UserData, UserTime};
 
 /// Timings per https://datatracker.ietf.org/doc/html/rfc6298
 #[derive(Debug, Clone)]
@@ -27,7 +27,7 @@ impl<T: UserTime> Timers<T> {
     }
 }
 
-impl<U: UserData> Socket<U> {
+impl<U: UserData> Connection<U> {
     pub(crate) fn set_timer_re_tx(&mut self, duration: Duration) {
         let deadline = U::Time::now().add(duration);
         self.timers.re_tx = Some(deadline);
@@ -48,7 +48,7 @@ impl<U: UserData> Socket<U> {
 
     pub(crate) fn on_timer_re_tx(&mut self) {
         log::trace!("on_timer_re_tx");
-        match self.connection_state {
+        match self.state() {
             ConnectionState::Listen
             | ConnectionState::SynSent
             | ConnectionState::SynReceived
@@ -70,7 +70,7 @@ impl<U: UserData> Socket<U> {
 
     pub(crate) fn on_timer_timewait(&mut self) {
         log::trace!("on_timer_timewait");
-        assert!(self.connection_state == ConnectionState::TimeWait);
+        assert!(self.state() == ConnectionState::TimeWait);
         self.clear();
     }
 
@@ -82,7 +82,7 @@ impl<U: UserData> Socket<U> {
 
     /// To be called whenever a timer expires, or simply periodically
     pub fn on_time_tick(&mut self, time: U::Time) {
-        log::trace!("state: {:?}", self.connection_state);
+        log::trace!("state: {:?}", self.state());
         log::trace!("on_timeout");
 
         if self.timers.re_tx.map_or(false, |t| t <= time) {

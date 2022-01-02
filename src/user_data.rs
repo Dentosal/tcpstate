@@ -17,6 +17,8 @@ pub trait UserData {
 
 pub trait UserTime: Copy + Ord {
     fn now() -> Self;
+
+    #[must_use]
     fn add(&self, duration: Duration) -> Self;
 }
 

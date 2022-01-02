@@ -21,7 +21,7 @@ fn tcp_seqn_wrap_around() {
         let client = SocketCtx::new(host_handler, rx);
         client
             .call(|socket| {
-                socket.options.nagle_delay = core::time::Duration::ZERO;
+                socket.options_mut().nagle_delay = core::time::Duration::ZERO;
                 socket.call_connect(server_addr)
             })
             .expect("Connect");

@@ -52,7 +52,7 @@ impl BlobQueue {
     }
 
     pub fn write_bytes(&mut self, data: Vec<u8>) {
-        if data.len() == 0 {
+        if data.is_empty() {
             return;
         }
         assert!(!self.fin);

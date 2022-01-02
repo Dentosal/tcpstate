@@ -58,7 +58,8 @@ pub fn open_pair() -> (SocketCtx, SocketCtx, impl FnMut()) {
 
     {
         let mut s = client.socket.lock().unwrap();
-        s.options.nagle_delay = core::time::Duration::ZERO;
+        println!("SSSS {:?}", s.state());
+        s.options_mut().nagle_delay = core::time::Duration::ZERO;
         expect_continue!(s.call_connect(server_addr));
     }
 
@@ -71,7 +72,7 @@ pub fn open_pair() -> (SocketCtx, SocketCtx, impl FnMut()) {
     let (_, server) = listen.accept().expect("Accept");
     {
         let mut s = server.socket.lock().unwrap();
-        s.options.nagle_delay = core::time::Duration::ZERO;
+        s.options_mut().nagle_delay = core::time::Duration::ZERO;
     }
 
     communicate();

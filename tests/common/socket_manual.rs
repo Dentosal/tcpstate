@@ -138,7 +138,7 @@ impl ListenCtx {
     pub fn accept(&self) -> Result<(RemoteAddr, SocketCtx), Error> {
         let (addr, s) = self.call(move |s| s.call_accept(|| self.host_handler.clone()))?;
 
-        let (socket, s_on_packet) = SocketCtx::from_socket(s);
+        let (socket, s_on_packet) = SocketCtx::from_socket(s.into());
         let mut m = self.map.lock().unwrap();
         m.insert(addr, Box::new(s_on_packet));
         Ok((addr, socket))
@@ -158,7 +158,7 @@ impl SocketCtx {
         let arc_socket = socket.clone();
         let rx_callback = move |pkt: Packet| {
             let mut s = arc_socket.lock().unwrap();
-            s.on_segment(pkt.seg);
+            s.on_segment(pkt.src, pkt.seg);
         };
 
         (Self { socket }, rx_callback)
@@ -166,7 +166,7 @@ impl SocketCtx {
 
     pub fn consume_event(&self) -> Result<(), Error> {
         let mut s = self.socket.lock().unwrap();
-        s.user_data.event.take().expect("No event active")
+        s.user_data_mut().event.take().expect("No event active")
     }
 
     pub fn call_close(&self) -> Result<(), Error> {
@@ -196,7 +196,7 @@ impl SocketCtx {
 
     pub fn recv_available(&self) -> usize {
         let mut guard = self.socket.lock().unwrap();
-        guard.recv_available()
+        guard.recv_available().unwrap()
     }
 
     pub fn on_time_tick(&self, time: ManualInstant) {

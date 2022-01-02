@@ -9,6 +9,10 @@ pub enum Error {
     ConnectionClosing,
     ListenClosed,
     TimedOut,
+    /// This socket is closed, and the operation is not accepted
+    Closed,
+    /// This socket is listening, and the operation is not accepted
+    Listening,
     EventNotActive,
     /// Not an actual error
     /// Retry the tried call again after the cookie-event occurs.

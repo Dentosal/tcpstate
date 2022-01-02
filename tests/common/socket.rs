@@ -112,7 +112,7 @@ impl ListenCtx {
         let (tx, rx) = bounded(10);
         let mut m = self.map.lock().unwrap();
         m.insert(addr, tx);
-        Ok((addr, SocketCtx::from_socket(rx, s)))
+        Ok((addr, SocketCtx::from_socket(rx, s.into())))
     }
 }
 
@@ -129,14 +129,14 @@ impl SocketCtx {
     }
 
     pub fn from_socket(rx: Receiver<Incoming>, socket: Socket<HostHandler>) -> Self {
-        let event = socket.user_data.event.clone();
+        let event = socket.user_data().event.clone();
         let socket = Arc::new(Mutex::new(socket));
         let arc_socket = socket.clone();
         let handle = thread::spawn(move || loop {
             match rx.recv().unwrap() {
                 Incoming::Packet(pkt) => {
                     let mut s = arc_socket.lock().unwrap();
-                    s.on_segment(pkt.seg);
+                    s.on_segment(pkt.src, pkt.seg);
                 }
                 Incoming::Timeout(now) => {
                     let mut s = arc_socket.lock().unwrap();
