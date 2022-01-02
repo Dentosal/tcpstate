@@ -1,8 +1,8 @@
 #![deny(unused_must_use)]
 
-use tcpstate::{mock::*, *};
+use tcpstate::*;
 
-use crate::sim_net::{HostHandler, Incoming};
+use crate::sim_net::{HostHandler, Incoming, RemoteAddr};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::collections::HashMap;

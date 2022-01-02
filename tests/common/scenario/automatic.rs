@@ -1,5 +1,4 @@
 use crossbeam_channel::{bounded, Sender};
-use tcpstate::mock::RemoteAddr;
 
 use crate::sim_net;
 use crate::socket::{ListenCtx, SocketCtx};
@@ -40,7 +39,7 @@ where
     net.wait()
 }
 
-pub fn echo_server() -> (sim_net::Network, RemoteAddr, Sender<()>) {
+pub fn echo_server() -> (sim_net::Network, sim_net::RemoteAddr, Sender<()>) {
     use std::thread;
 
     let net = sim_net::Network::new();

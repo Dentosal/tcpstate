@@ -12,9 +12,11 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use tcpstate::{mock::*, *};
+use tcpstate::*;
 
 use crate::sim_net::{Incoming, Packet};
+
+use super::sim_net::RemoteAddr;
 
 static NOW: AtomicU64 = AtomicU64::new(0);
 
@@ -55,6 +57,7 @@ impl ManualHandler {
 }
 impl UserData for ManualHandler {
     type Time = ManualInstant;
+    type Addr = RemoteAddr;
 
     fn new_seqn(&mut self) -> u32 {
         let result = self.next_seqn;

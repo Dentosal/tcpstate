@@ -3,13 +3,13 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::AtomicU32;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, RwLock,
 };
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use tcpstate::{mock::RemoteAddr, Cookie, Error, SegmentMeta};
+use tcpstate::{Cookie, Error, SegmentMeta};
 
 #[derive(Debug)]
 pub enum Incoming {
@@ -47,6 +47,16 @@ impl<T> Event<T> {
     }
 }
 
+static ADDR: AtomicU64 = AtomicU64::new(10_000);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RemoteAddr(u64);
+impl RemoteAddr {
+    pub fn new() -> Self {
+        Self(ADDR.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
 pub static INIT_SEQN: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone)]
@@ -58,6 +68,7 @@ pub struct HostHandler {
 
 impl tcpstate::UserData for HostHandler {
     type Time = Instant;
+    type Addr = RemoteAddr;
 
     fn new_seqn(&mut self) -> u32 {
         INIT_SEQN.load(Ordering::SeqCst)

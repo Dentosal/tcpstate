@@ -1,8 +1,8 @@
-use tcpstate::mock::RemoteAddr;
 use tcpstate::*;
 
 #[macro_use]
 mod common;
+use common::sim_net::RemoteAddr;
 use common::socket_manual::{ManualHandler, SocketCtx};
 use common::*;
 

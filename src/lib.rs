@@ -13,7 +13,6 @@ use core::time::Duration;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-pub mod mock;
 pub mod options;
 
 mod event;
@@ -26,8 +25,6 @@ mod state;
 mod timers;
 mod tx;
 mod user_data;
-
-use crate::mock::*;
 
 use event::{Events, WaitUntil};
 use options::*;
@@ -70,7 +67,7 @@ pub fn response_to_closed(seg: SegmentMeta) -> Option<SegmentMeta> {
 }
 
 pub struct Socket<U: UserData> {
-    remote: Option<RemoteAddr>,
+    remote: Option<U::Addr>,
     connection_state: ConnectionState,
     dup_ack_count: u8,
     congestation_window: u16,
@@ -250,7 +247,7 @@ impl<U: UserData> Socket<U> {
     }
 
     /// Establish a connection
-    pub fn call_connect(&mut self, remote: RemoteAddr) -> Result<(), Error> {
+    pub fn call_connect(&mut self, remote: U::Addr) -> Result<(), Error> {
         log::trace!("state: {:?}", self.connection_state);
         log::trace!("call_connect {:?}", remote);
         if matches!(
@@ -968,7 +965,7 @@ impl<U: UserData> Socket<U> {
 }
 
 pub struct ListenSocket<U: UserData> {
-    queue: VecDeque<(RemoteAddr, SegmentMeta)>,
+    queue: VecDeque<(U::Addr, SegmentMeta)>,
     backlog: usize,
     open: bool,
     events: Events<()>,
@@ -1018,10 +1015,10 @@ impl<U: UserData> ListenSocket<U> {
     }
 
     /// Accept a new connection from the backlog
-    pub fn call_accept<N: UserData, D: FnOnce() -> N>(
+    pub fn call_accept<D: FnOnce() -> U>(
         &mut self,
         make_user_data: D,
-    ) -> Result<(RemoteAddr, Socket<N>), Error> {
+    ) -> Result<(U::Addr, Socket<U>), Error> {
         log::trace!("call_accept");
 
         if !self.open {
@@ -1042,7 +1039,7 @@ impl<U: UserData> ListenSocket<U> {
 
     /// Called on incoming segment
     /// See RFC 793 page 64
-    pub fn on_segment(&mut self, addr: RemoteAddr, seg: SegmentMeta) {
+    pub fn on_segment(&mut self, addr: U::Addr, seg: SegmentMeta) {
         log::trace!("on_segment {:?}", seg);
 
         if seg.flags.contains(SegmentFlags::RST) {
