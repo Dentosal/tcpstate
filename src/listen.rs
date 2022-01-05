@@ -8,11 +8,27 @@ pub struct ListenSocket<U: UserData> {
     backlog: usize,
     open: bool,
     events: Events<()>,
-    pub options: SocketOptions,
-    pub user_data: U,
+    pub(crate) options: SocketOptions,
+    pub(crate) user_data: U,
 }
 
 impl<U: UserData> ListenSocket<U> {
+    pub fn user_data(&self) -> &U {
+        &self.user_data
+    }
+
+    pub fn user_data_mut(&mut self) -> &mut U {
+        &mut self.user_data
+    }
+
+    pub fn options(&self) -> &SocketOptions {
+        &self.options
+    }
+
+    pub fn options_mut(&mut self) -> &mut SocketOptions {
+        &mut self.options
+    }
+
     /// New socket in initial state
     pub fn call_listen(backlog: usize, user_data: U) -> Self {
         Self {
@@ -56,9 +72,9 @@ impl<U: UserData> ListenSocket<U> {
     }
 
     /// Accept a new connection from the backlog
-    pub fn call_accept<D: FnOnce() -> U>(
+    pub fn call_accept(
         &mut self,
-        make_user_data: D,
+        make_user_data: fn(&ListenSocket<U>) -> U,
     ) -> Result<(U::Addr, Connection<U>), Error> {
         log::trace!("call_accept");
 
@@ -67,9 +83,8 @@ impl<U: UserData> ListenSocket<U> {
         }
 
         if let Some((addr, seg)) = self.queue.pop_front() {
-            let user_data = make_user_data();
-            let mut socket = Connection::new(user_data);
-            socket.remote = Some(addr);
+            let user_data = make_user_data(self);
+            let mut socket = Connection::new(addr, user_data);
             socket.options = self.options.clone(); // Inherits options
             socket.set_state(ConnectionState::Listen);
             socket.on_segment(seg);

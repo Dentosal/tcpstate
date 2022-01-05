@@ -3,7 +3,7 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![feature(default_free_fn, duration_constants, let_else, drain_filter)]
 #![allow(dead_code, unreachable_code)]
-#![deny(unused_must_use)]
+#![deny(unused_must_use, unconditional_recursion)]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
@@ -159,9 +159,9 @@ impl<U: UserData> Socket<U> {
         let inner = core::mem::replace(&mut self.inner, SocketInner::SwapTemp);
         let SocketCommon { user_data, options } = inner.extract_common();
 
-        let mut c = Connection::new(user_data);
+        let mut c = Connection::new(remote, user_data);
         c.options = options;
-        let result = c.call_connect(remote);
+        let result = c.call_connect();
         self.inner = SocketInner::Connection(c);
         result
     }
@@ -178,9 +178,9 @@ impl<U: UserData> Socket<U> {
         Ok(())
     }
 
-    pub fn call_accept<D: FnOnce() -> U>(
+    pub fn call_accept(
         &mut self,
-        make_user_data: D,
+        make_user_data: fn(&ListenSocket<U>) -> U,
     ) -> Result<(U::Addr, Connection<U>), Error> {
         match &mut self.inner {
             SocketInner::SwapTemp => unreachable!(),

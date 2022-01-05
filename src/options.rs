@@ -19,7 +19,8 @@ pub struct SocketOptions {
 impl Default for SocketOptions {
     fn default() -> Self {
         Self {
-            nagle_delay: NAGLE_DELAY_DEFAULT,
+            // nagle_delay: NAGLE_DELAY_DEFAULT,
+            nagle_delay: Duration::ZERO,
         }
     }
 }

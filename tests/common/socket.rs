@@ -104,9 +104,11 @@ impl ListenCtx {
 
     pub fn accept(&self) -> Result<(RemoteAddr, SocketCtx), Error> {
         let (addr, s) = self.call_ret(|s| {
-            let mut host_handler = s.user_data.clone();
-            host_handler.event = Event::new(); // Detach events
-            s.call_accept(move || host_handler)
+            s.call_accept(|s| {
+                let mut host_handler = s.user_data().clone();
+                host_handler.event = Event::new(); // Detach events
+                host_handler
+            })
         })?;
 
         let (tx, rx) = bounded(10);

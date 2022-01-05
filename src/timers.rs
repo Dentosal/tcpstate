@@ -56,8 +56,7 @@ impl<U: UserData> Connection<U> {
                 if let Some(seg) = self.tx.re_tx.front() {
                     log::trace!("Resending {:?}", seg);
                     self.exp_backoff *= 2;
-                    self.user_data
-                        .send(self.remote.expect("No remote set"), seg.clone());
+                    self.user_data.send(self.remote, seg.clone());
                     self.set_timer_re_tx(self.timings.rto + Duration::new(self.exp_backoff, 0));
                 }
             }

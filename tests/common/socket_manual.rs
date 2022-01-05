@@ -54,6 +54,10 @@ impl ManualHandler {
     pub fn try_take(&self) -> Option<Incoming> {
         self.queue.lock().unwrap().pop_front()
     }
+
+    pub fn try_take_event(&mut self) -> Option<Result<(), Error>> {
+        self.event.take()
+    }
 }
 impl UserData for ManualHandler {
     type Time = ManualInstant;
@@ -124,7 +128,7 @@ impl ListenCtx {
 
     pub fn consume_event(&self) -> Result<(), Error> {
         let mut s = self.socket.lock().unwrap();
-        s.user_data.event.take().expect("No event active")
+        s.user_data_mut().event.take().expect("No event active")
     }
 
     pub fn call<T, F: FnMut(&mut ListenSocket<ManualHandler>) -> Result<T, Error>>(
@@ -136,7 +140,7 @@ impl ListenCtx {
     }
 
     pub fn accept(&self) -> Result<(RemoteAddr, SocketCtx), Error> {
-        let (addr, s) = self.call(move |s| s.call_accept(|| self.host_handler.clone()))?;
+        let (addr, s) = self.call(move |s| s.call_accept(|s| s.user_data().clone()))?;
 
         let (socket, s_on_packet) = SocketCtx::from_socket(s.into());
         let mut m = self.map.lock().unwrap();

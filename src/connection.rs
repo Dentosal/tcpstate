@@ -10,7 +10,7 @@ use crate::UserData;
 use crate::*;
 
 pub struct Connection<U: UserData> {
-    pub(crate) remote: Option<U::Addr>,
+    pub(crate) remote: U::Addr,
     connection_state: ConnectionState,
     dup_ack_count: u8,
     congestation_window: u16,
@@ -20,15 +20,31 @@ pub struct Connection<U: UserData> {
     pub(crate) exp_backoff: u64,
     pub(crate) timers: Timers<U::Time>,
     events: Events<WaitUntil>,
-    pub options: SocketOptions,
-    pub user_data: U,
+    pub(crate) options: SocketOptions,
+    pub(crate) user_data: U,
 }
 
 impl<U: UserData> Connection<U> {
+    pub fn user_data(&self) -> &U {
+        &self.user_data
+    }
+
+    pub fn user_data_mut(&mut self) -> &mut U {
+        &mut self.user_data
+    }
+
+    pub fn options(&self) -> &SocketOptions {
+        &self.options
+    }
+
+    pub fn options_mut(&mut self) -> &mut SocketOptions {
+        &mut self.options
+    }
+
     /// New socket in initial state
-    pub fn new(user_data: U) -> Self {
+    pub fn new(remote: U::Addr, user_data: U) -> Self {
         Self {
-            remote: None,
+            remote,
             connection_state: ConnectionState::Closed,
             dup_ack_count: 0,
             congestation_window: INITIAL_WINDOW_SIZE,
@@ -51,6 +67,10 @@ impl<U: UserData> Connection<U> {
             log::trace!("Triggered cookie {:?} with result {:?}", cookie, r);
             self.user_data.event(cookie, r);
         }
+    }
+
+    pub fn remote(&self) -> U::Addr {
+        self.remote
     }
 
     pub fn state(&self) -> ConnectionState {
@@ -188,14 +208,13 @@ impl<U: UserData> Connection<U> {
     }
 
     /// Establish a connection
-    pub fn call_connect(&mut self, remote: U::Addr) -> Result<(), Error> {
+    pub fn call_connect(&mut self) -> Result<(), Error> {
         log::trace!("state: {:?}", self.connection_state);
-        log::trace!("call_connect {:?}", remote);
+        log::trace!("call_connect {:?}", self.remote);
         if matches!(
             self.connection_state,
             ConnectionState::Closed | ConnectionState::Reset
         ) {
-            self.remote = Some(remote);
             self.set_state(ConnectionState::SynSent);
             self.tx.init(SeqN::new(self.user_data.new_seqn()));
             let seg = SegmentMeta {
@@ -205,7 +224,7 @@ impl<U: UserData> Connection<U> {
                 flags: SegmentFlags::SYN,
                 data: Vec::new(),
             };
-            self.user_data.send(remote, seg.clone());
+            self.user_data.send(self.remote, seg.clone());
             self.tx.on_send(seg);
             self.set_timer_re_tx(self.timings.rto);
             self.events.return_continue_after(WaitUntil::Established)
@@ -492,7 +511,7 @@ impl<U: UserData> Connection<U> {
             }
             ConnectionState::SynReceived | ConnectionState::Established { .. } => {
                 self.user_data.send(
-                    self.remote.expect("No remote set"),
+                    self.remote,
                     SegmentMeta {
                         seqn: self.tx.next,
                         ackn: SeqN::ZERO,
@@ -562,8 +581,7 @@ impl<U: UserData> Connection<U> {
         }
 
         self.tx.on_send(seg.clone());
-        self.user_data
-            .send(self.remote.expect("No remote set"), seg);
+        self.user_data.send(self.remote, seg);
 
         if needs_resend {
             self.set_timer_re_tx(self.timings.rto);
@@ -580,8 +598,7 @@ impl<U: UserData> Connection<U> {
             ConnectionState::Closed | ConnectionState::Reset => {
                 log::trace!("Connection closed, replying");
                 if let Some(resp) = response_to_closed(seg) {
-                    self.user_data
-                        .send(self.remote.expect("No remote set"), resp);
+                    self.user_data.send(self.remote, resp);
                 }
             }
             ConnectionState::Listen => {
@@ -591,7 +608,7 @@ impl<U: UserData> Connection<U> {
 
                 if seg.flags.contains(SegmentFlags::ACK) {
                     self.user_data.send(
-                        self.remote.expect("No remote set"),
+                        self.remote,
                         SegmentMeta {
                             seqn: seg.ackn,
                             ackn: SeqN::ZERO,
@@ -608,10 +625,6 @@ impl<U: UserData> Connection<U> {
                     return;
                 }
 
-                assert!(
-                    self.remote.is_some(),
-                    "Listener should have stored remote address"
-                );
                 self.rx.init(seg.seqn);
                 self.tx.init(SeqN::new(self.user_data.new_seqn()));
                 // TODO: queue data, control if any available
@@ -628,8 +641,7 @@ impl<U: UserData> Connection<U> {
 
                 self.set_timer_re_tx(self.timings.rto);
                 self.tx.on_send(seg.clone());
-                self.user_data
-                    .send(self.remote.expect("No remote set"), seg);
+                self.user_data.send(self.remote, seg);
             }
 
             ConnectionState::SynSent => {
@@ -637,7 +649,7 @@ impl<U: UserData> Connection<U> {
                     && !seg.ackn.in_range_inclusive(self.tx.unack, self.tx.next)
                 {
                     self.user_data.send(
-                        self.remote.expect("No remote set"),
+                        self.remote,
                         SegmentMeta {
                             seqn: seg.ackn,
                             ackn: SeqN::ZERO,
@@ -673,10 +685,10 @@ impl<U: UserData> Connection<U> {
             | ConnectionState::SynReceived
             | ConnectionState::Established { .. } => {
                 if !self.check_segment_seq_ok(&seg) {
-                    log::trace!("Non-acceptable segment {:#?}", seg);
+                    log::trace!("Non-acceptable segment {:#?}\n{:?}", seg, self.rx);
                     if !seg.flags.contains(SegmentFlags::RST) {
                         self.user_data.send(
-                            self.remote.expect("No remote set"),
+                            self.remote,
                             SegmentMeta {
                                 seqn: self.tx.next,
                                 ackn: self.rx.ackd,
@@ -714,7 +726,7 @@ impl<U: UserData> Connection<U> {
 
                     // Error! Send reset, flush all queues
                     self.user_data.send(
-                        self.remote.expect("No remote set"),
+                        self.remote,
                         SegmentMeta {
                             seqn: self.tx.next,
                             ackn: SeqN::ZERO,
@@ -834,8 +846,7 @@ impl<U: UserData> Connection<U> {
                             flags: SegmentFlags::ACK,
                             data: Vec::new(),
                         };
-                        self.user_data
-                            .send(self.remote.expect("No remote set"), seg);
+                        self.user_data.send(self.remote, seg);
                         return;
                     } else {
                         log::trace!("out-of-order {:?} != {:?}", seg.seqn, self.rx.ackd);
