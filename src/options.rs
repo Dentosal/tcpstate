@@ -19,6 +19,7 @@ pub struct SocketOptions {
 impl Default for SocketOptions {
     fn default() -> Self {
         Self {
+            // TODO: Nagle's algorithm is not supported yet
             // nagle_delay: NAGLE_DELAY_DEFAULT,
             nagle_delay: Duration::ZERO,
         }
